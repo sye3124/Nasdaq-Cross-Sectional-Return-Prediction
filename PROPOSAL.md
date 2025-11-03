@@ -5,9 +5,9 @@
 ---
 
 ### Problem Statement and Motivation  
-According to the **weak form of the Efficient Market Hypothesis (EMH)**, all information contained in past prices, returns, and trading volumes is already reflected in current stock prices. If this holds true, then historical data should not provide any predictive power for future price movements, and price changes should follow a **random walk**.  
+According to the **Weak form of the Efficient Market Hypothesis (EMH)**, all information contained in past prices, returns, and trading volumes is already reflected in current stock prices. If this holds true, then historical data should not provide any predictive power for future price movements, and price changes should follow a **random walk**.
 
-However, in practice, many traders and quantitative analysts continue to develop models based on historical data, believing that behavioral or structural inefficiencies may allow for limited predictability. This project aims to **empirically test the weak-form efficiency** of the Nasdaq stock market by attempting to predict future returns using only past information.  
+However, in practice, many traders and quantitative analysts continue to develop models based on historical data, believing that behavioural or structural inefficiencies may allow for limited predictability. This project aims to **empirically test the weak-form efficiency** of the Nasdaq stock market by attempting to predict future returns using only past information.
 
 The core question is:  
 > Can historical price and volume data be used to predict future returns for Nasdaq-listed stocks, or does the data support the weak form of market efficiency?
