@@ -8,7 +8,12 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-from src.training_scheme import WindowConfig, rolling_oos_predictions
+from src.training_scheme import (
+    CandidateModel,
+    WindowConfig,
+    rolling_oos_predictions,
+    rolling_time_series_tuning,
+)
 
 
 def _build_panel(values_by_date):
@@ -19,6 +24,17 @@ def _build_panel(values_by_date):
     return pd.DataFrame(
         vals, index=pd.MultiIndex.from_tuples(index, names=["ticker", "date"])
     )
+
+
+class _DummyLinearModel:
+    def __init__(self, weight: float):
+        self.weight = weight
+
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X):
+        return X[:, 0] * self.weight
 
 
 def test_rolling_predictions_respect_min_and_max_window():
@@ -59,3 +75,50 @@ def test_expanding_window_grows_history():
     # resulting in the mean of [1, 1, 3] = 5/3 with a single feature equal to one.
     last_pred = preds.xs(dates[3], level="date")
     assert last_pred.iloc[0]["prediction"] == pytest.approx(5 / 3)
+
+def test_time_series_tuning_selects_best_candidate_and_tracks_models():
+    dates = pd.date_range("2020-01-31", periods=6, freq="ME")
+    records = []
+    for i, date in enumerate(dates):
+        for ticker, offset in [("AAA", 1.0), ("BBB", 2.0)]:
+            feature = i + offset
+            records.append(
+                {
+                    "ticker": ticker,
+                    "date": date,
+                    "feature": feature,
+                    "next_return": 2 * feature,
+                }
+            )
+
+    panel = pd.DataFrame.from_records(records).set_index(["ticker", "date"])
+
+    candidates = [
+        CandidateModel("underfit", lambda: _DummyLinearModel(1.0)),
+        CandidateModel("best", lambda: _DummyLinearModel(2.0)),
+    ]
+
+    cfg = WindowConfig(min_train_months=3, max_train_months=4, prediction_col="cv_pred")
+    result = rolling_time_series_tuning(
+        panel,
+        ["feature"],
+        candidates=candidates,
+        window_config=cfg,
+        cv_folds=2,
+    )
+
+    preds = result.predictions
+    assert not preds.empty
+    assert set(preds.columns) == {"cv_pred"}
+
+    expected_dates = dates[cfg.min_train_months :]
+    assert list(preds.index.get_level_values("date").unique()) == list(expected_dates)
+
+    for date in expected_dates:
+        model_info = result.best_models[pd.to_datetime(date)]
+        assert model_info.name == "best"
+        assert set(model_info.cv_scores) == {"spearman", "r2", "mae"}
+
+        oos_pred = preds.xs(date, level="date")["cv_pred"]
+        true_feature = panel.xs(date, level="date")["feature"]
+        np.testing.assert_allclose(oos_pred.values, 2 * true_feature.values)
