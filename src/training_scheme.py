@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
+
+from sklearn.linear_model import ElasticNetCV, LassoCV, RidgeCV
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 @dataclass
@@ -156,4 +160,140 @@ def rolling_oos_predictions(
 __all__ = [
     "WindowConfig",
     "rolling_oos_predictions",
+    "RegularizedModelConfig",
+    "rolling_regularized_predictions",
 ]
+
+
+@dataclass
+class RegularizedModelConfig:
+    """Configuration for rolling regularized regressions.
+
+    Attributes
+    ----------
+    model_type : {"lasso", "ridge", "elasticnet"}
+        Choice of regularization penalty.
+    alphas : Sequence[float]
+        Candidate regularization strengths used during cross-validation.
+    l1_ratios : Sequence[float] | None
+        Candidate L1 ratios for elastic net. Required when ``model_type`` is
+        ``"elasticnet"`` and ignored otherwise.
+    cv_folds : int
+        Number of cross-validation folds applied inside each training window.
+    max_iter : int
+        Maximum iterations for the coordinate-descent solvers.
+    random_state : int | None
+        Random seed used by stochastic solvers (lasso and elastic net).
+    """
+
+    model_type: Literal["lasso", "ridge", "elasticnet"] = "ridge"
+    alphas: Sequence[float] = tuple(np.logspace(-4, 1, 10))
+    l1_ratios: Sequence[float] | None = None
+    cv_folds: int = 5
+    max_iter: int = 10000
+    random_state: int | None = 0
+
+    def __post_init__(self) -> None:
+        if self.model_type == "elasticnet" and not self.l1_ratios:
+            raise ValueError("l1_ratios must be provided for elasticnet models.")
+        if self.model_type not in {"lasso", "ridge", "elasticnet"}:
+            raise ValueError("model_type must be 'lasso', 'ridge', or 'elasticnet'.")
+
+
+def _build_regularized_model(cfg: RegularizedModelConfig):
+    """Create a cross-validated regularized regression wrapped in a pipeline."""
+
+    if cfg.model_type == "ridge":
+        base_model = RidgeCV(alphas=cfg.alphas, cv=cfg.cv_folds, fit_intercept=True)
+    elif cfg.model_type == "lasso":
+        base_model = LassoCV(
+            alphas=cfg.alphas,
+            cv=cfg.cv_folds,
+            max_iter=cfg.max_iter,
+            random_state=cfg.random_state,
+        )
+    else:
+        base_model = ElasticNetCV(
+            alphas=cfg.alphas,
+            l1_ratio=cfg.l1_ratios,
+            cv=cfg.cv_folds,
+            max_iter=cfg.max_iter,
+            random_state=cfg.random_state,
+        )
+
+    return make_pipeline(StandardScaler(), base_model)
+
+
+def rolling_regularized_predictions(
+    panel: pd.DataFrame,
+    feature_cols: Sequence[str],
+    *,
+    target_col: str = "next_return",
+    window_config: WindowConfig | None = None,
+    model_config: RegularizedModelConfig | None = None,
+) -> pd.DataFrame:
+    """Generate rolling/expanding predictions using regularized regressions.
+
+    The helper mirrors :func:`rolling_oos_predictions` but cross-validates
+    regularization hyperparameters inside each training window before fitting
+    the final model used to score the next period's cross-section.
+    """
+
+    _validate_multiindex(panel)
+
+    cfg = window_config or WindowConfig()
+    model_cfg = model_config or RegularizedModelConfig()
+
+    # Use DISTINCT, SORTED dates so min_train_months is in "months", not rows
+    dates = panel.index.get_level_values("date").unique().sort_values()
+
+    preds: list[pd.Series] = []
+
+    # Start at cfg.min_train_months so the first prediction is at dates[min_train_months]
+    for idx in range(cfg.min_train_months, len(dates)):
+        current_date = dates[idx]
+
+        if cfg.expanding:
+            train_start = 0
+        else:
+            train_start = max(0, idx - cfg.max_train_months)
+
+        # Training dates are strictly BEFORE current_date
+        train_dates = dates[train_start:idx]
+
+        # Mask panel to those training dates
+        train_mask = panel.index.get_level_values("date").isin(train_dates)
+        train_df = panel.loc[train_mask]
+        train_df = train_df.dropna(subset=[*feature_cols, target_col])
+        if train_df.empty:
+            continue
+
+        train_X = train_df[list(feature_cols)].to_numpy()
+        train_y = train_df[target_col].to_numpy()
+
+        model = _build_regularized_model(model_cfg)
+        model.fit(train_X, train_y)
+
+        # OOS prediction on the current date cross-section
+        oos_df = panel.xs(current_date, level="date", drop_level=False)
+        oos_features = oos_df[list(feature_cols)].dropna()
+        if oos_features.empty:
+            continue
+
+        oos_pred = model.predict(oos_features.to_numpy())
+        pred_series = pd.Series(oos_pred, index=oos_features.index, name=cfg.prediction_col)
+        preds.append(pred_series)
+
+    if not preds:
+        empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
+        return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
+
+    result = pd.concat(preds).to_frame()
+    result.index = pd.MultiIndex.from_arrays(
+        [
+            result.index.get_level_values("ticker"),
+            pd.to_datetime(result.index.get_level_values("date")),
+        ],
+        names=["ticker", "date"],
+    )
+    return result.sort_index()
