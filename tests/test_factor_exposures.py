@@ -49,7 +49,7 @@ def test_compute_factor_exposures_lagged_betas():
 
 
 def test_compute_factor_exposures_not_enough_history_returns_empty():
-    dates = pd.date_range("2020-01-31", periods=3, freq="M")
+    dates = pd.date_range("2020-01-31", periods=3, freq="ME")
     factors = pd.DataFrame(
         {"MKT": 0.0, "SMB": 0.0, "HML": 0.0, "RF": 0.0}, index=dates
     )
