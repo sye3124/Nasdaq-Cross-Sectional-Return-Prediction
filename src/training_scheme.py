@@ -1,0 +1,159 @@
+"""Helpers for rolling/expanding training, validation, and OOS prediction."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Sequence
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass
+class WindowConfig:
+    """Configuration for rolling/expanding model estimation.
+
+    Attributes
+    ----------
+    min_train_months : int
+        Minimum number of distinct months required before the first prediction.
+    max_train_months : int
+        Maximum lookback window for rolling estimation. Ignored when ``expanding``
+        is ``True``.
+    expanding : bool
+        When ``True``, grow the window from the start date; otherwise use a
+        trailing window capped by ``max_train_months``.
+    prediction_col : str
+        Name of the output column containing stored predictions.
+    """
+
+    min_train_months: int = 60
+    max_train_months: int = 120
+    expanding: bool = False
+    prediction_col: str = "prediction"
+
+    def __post_init__(self) -> None:
+        if self.min_train_months <= 0:
+            raise ValueError("min_train_months must be positive.")
+        if self.max_train_months <= 0:
+            raise ValueError("max_train_months must be positive.")
+        if self.min_train_months > self.max_train_months and not self.expanding:
+            raise ValueError("min_train_months cannot exceed max_train_months for rolling windows.")
+
+
+def _ols_predict(train_X: np.ndarray, train_y: np.ndarray, test_X: np.ndarray) -> np.ndarray:
+    """Fit an OLS model with an intercept and predict on ``test_X``."""
+
+    X_design = np.column_stack([np.ones(len(train_X)), train_X])
+    coefs, *_ = np.linalg.lstsq(X_design, train_y, rcond=None)
+
+    X_test = np.column_stack([np.ones(len(test_X)), test_X])
+    return X_test @ coefs
+
+
+def _validate_multiindex(panel: pd.DataFrame) -> None:
+    if not isinstance(panel.index, pd.MultiIndex) or panel.index.names[:2] != ["ticker", "date"]:
+        raise ValueError("panel must be indexed by ('ticker', 'date').")
+
+
+def rolling_oos_predictions(
+    panel: pd.DataFrame,
+    feature_cols: Sequence[str],
+    *,
+    target_col: str = "next_return",
+    window_config: WindowConfig | None = None,
+    model_factory: Callable[[], None] | None = None,
+) -> pd.DataFrame:
+    """Generate rolling or expanding out-of-sample predictions.
+
+    The function follows a typical asset-pricing backtest:
+
+    * Fit on the prior ``min_train_months``–``max_train_months`` of data
+      (or the full history when ``expanding``).
+    * Predict the next month.
+    * Advance the window and repeat, storing each period's predictions.
+
+    Parameters
+    ----------
+    panel : pd.DataFrame
+        Multi-indexed by ``('ticker', 'date')`` containing features and the
+        target column.
+    feature_cols : Sequence[str]
+        Columns used as regressors in the cross-sectional model.
+    target_col : str, optional
+        Name of the dependent variable column. Defaults to ``"next_return"``.
+    window_config : WindowConfig, optional
+        Controls window sizes and output column naming. Defaults to a 5–10 year
+        (60–120 month) rolling window.
+    model_factory : Callable[[], None], optional
+        Placeholder for future model customization. When ``None``, a simple OLS
+        is used.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame indexed by ``('ticker', 'date')`` containing a single column
+        with the stored predictions for each out-of-sample period.
+    """
+
+    _validate_multiindex(panel)
+
+    cfg = window_config or WindowConfig()
+
+    dates = pd.Index(sorted(panel.index.get_level_values("date")))
+    preds: list[pd.Series] = []
+
+    for idx, current_date in enumerate(dates):
+        train_end = idx  # exclusive: train on dates strictly before current_date
+        if cfg.expanding:
+            train_start = 0
+        else:
+            train_start = max(0, train_end - cfg.max_train_months)
+
+        train_dates = dates[train_start:train_end]
+        if len(train_dates.unique()) < cfg.min_train_months:
+            continue
+
+        train_mask = panel.index.get_level_values("date").isin(train_dates)
+        train_df = panel.loc[train_mask]
+        train_df = train_df.dropna(subset=[*feature_cols, target_col])
+        if train_df.empty:
+            continue
+
+        train_X = train_df[list(feature_cols)].to_numpy()
+        train_y = train_df[target_col].to_numpy()
+
+        # Model factory hook allows plugging in alternative estimators without
+        # changing the windowing logic. The default path uses OLS via NumPy.
+        if model_factory:
+            model = model_factory()
+            model.fit(train_X, train_y)
+            predictor = model.predict
+        else:
+            predictor = lambda X: _ols_predict(train_X, train_y, X)
+
+        oos_df = panel.xs(current_date, level="date", drop_level=False)
+        oos_features = oos_df[list(feature_cols)].dropna()
+        if oos_features.empty:
+            continue
+
+        oos_pred = predictor(oos_features.to_numpy())
+        pred_series = pd.Series(oos_pred, index=oos_features.index, name=cfg.prediction_col)
+        preds.append(pred_series)
+
+    if not preds:
+        empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
+        return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
+
+    result = pd.concat(preds).to_frame()
+    result.index = pd.MultiIndex.from_arrays(
+        [result.index.get_level_values("ticker"), pd.to_datetime(result.index.get_level_values("date"))],
+        names=["ticker", "date"],
+    )
+    return result.sort_index()
+
+
+__all__ = [
+    "WindowConfig",
+    "rolling_oos_predictions",
+]
