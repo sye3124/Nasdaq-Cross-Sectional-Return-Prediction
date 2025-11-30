@@ -71,55 +71,27 @@ def rolling_oos_predictions(
     window_config: WindowConfig | None = None,
     model_factory: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
-    """Generate rolling or expanding out-of-sample predictions.
-
-    The function follows a typical asset-pricing backtest:
-
-    * Fit on the prior ``min_train_months``–``max_train_months`` of data
-      (or the full history when ``expanding``).
-    * Predict the next month.
-    * Advance the window and repeat, storing each period's predictions.
-
-    Parameters
-    ----------
-    panel : pd.DataFrame
-        Multi-indexed by ``('ticker', 'date')`` containing features and the
-        target column.
-    feature_cols : Sequence[str]
-        Columns used as regressors in the cross-sectional model.
-    target_col : str, optional
-        Name of the dependent variable column. Defaults to ``"next_return"``.
-    window_config : WindowConfig, optional
-        Controls window sizes and output column naming. Defaults to a 5–10 year
-        (60–120 month) rolling window.
-    model_factory : Callable[[], None], optional
-        Placeholder for future model customization. When ``None``, a simple OLS
-        is used.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame indexed by ``('ticker', 'date')`` containing a single column
-        with the stored predictions for each out-of-sample period.
-    """
+    """Generate rolling or expanding out-of-sample predictions."""
 
     _validate_multiindex(panel)
 
     cfg = window_config or WindowConfig()
 
-    dates = pd.Index(sorted(panel.index.get_level_values("date")))
+    # Use DISTINCT, SORTED dates so "months" means unique months, not rows
+    dates = panel.index.get_level_values("date").unique().sort_values()
     preds: list[pd.Series] = []
 
-    for idx, current_date in enumerate(dates):
-        train_end = idx  # exclusive: train on dates strictly before current_date
+    # First OOS prediction at dates[cfg.min_train_months]
+    for idx in range(cfg.min_train_months, len(dates)):
+        current_date = dates[idx]
+
+        # Training window: all dates strictly before current_date
         if cfg.expanding:
             train_start = 0
         else:
-            train_start = max(0, train_end - cfg.max_train_months)
+            train_start = max(0, idx - cfg.max_train_months)
 
-        train_dates = dates[train_start:train_end]
-        if len(train_dates.unique()) < cfg.min_train_months:
-            continue
+        train_dates = dates[train_start:idx]
 
         train_mask = panel.index.get_level_values("date").isin(train_dates)
         train_df = panel.loc[train_mask]
@@ -130,8 +102,6 @@ def rolling_oos_predictions(
         train_X = train_df[list(feature_cols)].to_numpy()
         train_y = train_df[target_col].to_numpy()
 
-        # Model factory hook allows plugging in alternative estimators without
-        # changing the windowing logic. The default path uses OLS via NumPy.
         if model_factory:
             model = model_factory()
             model.fit(train_X, train_y)
@@ -139,6 +109,7 @@ def rolling_oos_predictions(
         else:
             predictor = lambda X: _ols_predict(train_X, train_y, X)
 
+        # OOS features at current_date
         oos_df = panel.xs(current_date, level="date", drop_level=False)
         oos_features = oos_df[list(feature_cols)].dropna()
         if oos_features.empty:
@@ -154,7 +125,10 @@ def rolling_oos_predictions(
 
     result = pd.concat(preds).to_frame()
     result.index = pd.MultiIndex.from_arrays(
-        [result.index.get_level_values("ticker"), pd.to_datetime(result.index.get_level_values("date"))],
+        [
+            result.index.get_level_values("ticker"),
+            pd.to_datetime(result.index.get_level_values("date")),
+        ],
         names=["ticker", "date"],
     )
     return result.sort_index()
@@ -199,6 +173,8 @@ class RegularizedModelConfig:
     cv_folds: int = 5
     max_iter: int = 10000
     random_state: int | None = 0
+    # NEW: scoring used for RidgeCV (lasso/elasticnet ignore this)
+    scoring: str | None = "neg_mean_squared_error"
 
     def __post_init__(self) -> None:
         if self.model_type == "elasticnet" and not self.l1_ratios:
@@ -235,7 +211,12 @@ def _build_regularized_model(cfg: RegularizedModelConfig):
     """Create a cross-validated regularized regression wrapped in a pipeline."""
 
     if cfg.model_type == "ridge":
-        base_model = RidgeCV(alphas=cfg.alphas, cv=cfg.cv_folds, fit_intercept=True)
+        base_model = RidgeCV(
+            alphas=cfg.alphas,
+            cv=cfg.cv_folds,
+            fit_intercept=True,
+            scoring=cfg.scoring,  # <- use MSE-based scoring
+        )
     elif cfg.model_type == "lasso":
         base_model = LassoCV(
             alphas=cfg.alphas,
