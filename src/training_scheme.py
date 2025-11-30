@@ -280,11 +280,11 @@ def rolling_regularized_predictions(
         if train_df.empty:
             continue
 
-        train_X = train_df[list(feature_cols)].to_numpy()
+        train_x = train_df[list(feature_cols)].to_numpy()
         train_y = train_df[target_col].to_numpy()
 
         model = _build_regularized_model(model_cfg)
-        model.fit(train_X, train_y)
+        model.fit(train_x, train_y)
 
         # OOS prediction on the current date cross-section
         oos_df = panel.xs(current_date, level="date", drop_level=False)
@@ -356,9 +356,9 @@ def _time_series_cv_scores(
         model = model_factory()
         model.fit(fit_df[list(feature_cols)].to_numpy(), fit_df[target_col].to_numpy())
 
-        val_X = val_df[list(feature_cols)].to_numpy()
+        val_x = val_df[list(feature_cols)].to_numpy()
         val_y = val_df[target_col].to_numpy()
-        preds = model.predict(val_X)
+        preds = model.predict(val_x)
 
         spearman = stats.spearmanr(val_y, preds).correlation
         r2 = r2_score(val_y, preds) if len(val_y) > 1 else np.nan

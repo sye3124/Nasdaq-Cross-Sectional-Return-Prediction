@@ -1,6 +1,7 @@
 from .factor_exposures import ExposureConfig, compute_factor_exposures
 from .linear_models import CrossSectionalOLSConfig, cross_sectional_ols
 from .oos_predictions import generate_oos_predictions_all_models
+from .portfolios import compute_decile_portfolio_returns
 from .ranking import RankingConfig, convert_predictions_to_rankings
 from .tree_models import (
     GradientBoostingConfig,
@@ -19,6 +20,7 @@ __all__ = [
     "cross_sectional_random_forest",
     "cross_sectional_gradient_boosting",
     "generate_oos_predictions_all_models",
+    "compute_decile_portfolio_returns",
     "RankingConfig",
     "convert_predictions_to_rankings",
 ]

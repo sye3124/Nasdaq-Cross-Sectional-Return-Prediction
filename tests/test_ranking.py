@@ -9,7 +9,6 @@ sys.path.append(str(ROOT))
 
 from src.ranking import RankingConfig, convert_predictions_to_rankings
 
-
 def _make_index(dates, tickers):
     return pd.MultiIndex.from_product([tickers, dates], names=["ticker", "date"])
 
@@ -103,3 +102,4 @@ def test_risk_adjustment_with_beta_and_zscore_basis():
     second_month = ranks.xs(dates[1], level="date")
     assert second_month.loc["AAA", "beta_rank"] == pytest.approx(1.0)
     assert second_month.loc["BBB", "beta_rank"] == pytest.approx(0.5)
+    

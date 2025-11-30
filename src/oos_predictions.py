@@ -9,7 +9,7 @@ from typing import Iterable, Sequence
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
-from .training_scheme import (
+from training_scheme import (
     RegularizedModelConfig,
     WindowConfig,
     rolling_oos_predictions,
