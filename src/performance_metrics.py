@@ -7,6 +7,7 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -213,4 +214,178 @@ __all__ = [
     "compute_long_short_returns",
     "compute_turnover_from_weights",
     "summarize_portfolio_performance",
+    "jobson_korkie_test",
+    "bootstrap_sharpe_ratio_difference",
 ]
+
+
+def _compute_sharpe_ratio(
+    returns: pd.Series, *, risk_free_rate: float = 0.0, periods_per_year: int = 12
+) -> float:
+    excess = returns.dropna() - risk_free_rate / periods_per_year
+    volatility = excess.std(ddof=1)
+    if volatility == 0 or np.isnan(volatility):
+        return np.nan
+    return excess.mean() / volatility * math.sqrt(periods_per_year)
+
+
+def _align_model_returns(
+    returns: pd.DataFrame, model_1: object, model_2: object
+) -> pd.DataFrame:
+    if model_1 not in returns.columns or model_2 not in returns.columns:
+        raise KeyError("Both model columns must be present in the returns DataFrame")
+
+    aligned = returns[[model_1, model_2]].dropna()
+    aligned.index = pd.to_datetime(aligned.index)
+    return aligned.sort_index()
+
+
+def jobson_korkie_test(
+    returns: pd.DataFrame,
+    *,
+    model_1: object,
+    model_2: object,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = 12,
+    memmel_correction: bool = True,
+) -> pd.Series:
+    """Jobson-Korkie test (with optional Memmel correction) for Sharpe ratios.
+
+    Parameters
+    ----------
+    returns : pd.DataFrame
+        DataFrame with columns for each model's returns. Index is interpreted as
+        time and is coerced to ``DatetimeIndex``.
+    model_1, model_2 : hashable
+        Column labels for the two models to compare.
+    risk_free_rate : float, default 0.0
+        Annualized risk-free rate used to compute excess returns.
+    periods_per_year : int, default 12
+        Number of return observations per year.
+    memmel_correction : bool, default True
+        Apply the small-sample correction proposed by Memmel (2003).
+
+    Returns
+    -------
+    pd.Series
+        Contains the Sharpe ratios for each model, their difference, the test
+        statistic, and two-sided p-value.
+    """
+
+    aligned = _align_model_returns(returns, model_1, model_2)
+    n = len(aligned)
+    if n < 2:
+        return pd.Series(
+            {
+                "sharpe_1": np.nan,
+                "sharpe_2": np.nan,
+                "sharpe_diff": np.nan,
+                "jk_stat": np.nan,
+                "p_value": np.nan,
+                "periods": n,
+            }
+        )
+
+    sr1 = _compute_sharpe_ratio(
+        aligned[model_1], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
+    )
+    sr2 = _compute_sharpe_ratio(
+        aligned[model_2], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
+    )
+
+    cov = aligned.cov(ddof=1).iloc[0, 1]
+    vol1 = aligned[model_1].std(ddof=1)
+    vol2 = aligned[model_2].std(ddof=1)
+    rho = cov / (vol1 * vol2) if vol1 and vol2 else np.nan
+
+    variance = np.nan
+    if not np.isnan(rho):
+        variance = (
+            (2 * (1 - rho) * sr1 * sr2) + 0.5 * (sr1**2 + sr2**2)
+        ) / n
+        if memmel_correction and n > 1:
+            variance -= ((sr1 - sr2) ** 2) / (2 * (n - 1))
+
+    jk_stat = (sr1 - sr2) / math.sqrt(variance) if variance and variance > 0 else np.nan
+    p_value = 2 * (1 - stats.norm.cdf(abs(jk_stat))) if not np.isnan(jk_stat) else np.nan
+
+    return pd.Series(
+        {
+            "sharpe_1": sr1,
+            "sharpe_2": sr2,
+            "sharpe_diff": sr1 - sr2,
+            "jk_stat": jk_stat,
+            "p_value": p_value,
+            "periods": n,
+        }
+    )
+
+
+def bootstrap_sharpe_ratio_difference(
+    returns: pd.DataFrame,
+    *,
+    model_1: object,
+    model_2: object,
+    n_bootstrap: int = 1000,
+    random_state: int | None = None,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = 12,
+) -> pd.Series:
+    """Bootstrap test for differences in model Sharpe ratios.
+
+    A percentile bootstrap is used to approximate the sampling distribution of
+    the Sharpe ratio difference. The function returns the observed difference,
+    bootstrap mean and standard deviation, and a two-sided p-value.
+    """
+
+    aligned = _align_model_returns(returns, model_1, model_2)
+    n = len(aligned)
+    if n == 0 or n_bootstrap <= 0:
+        return pd.Series(
+            {
+                "sharpe_1": np.nan,
+                "sharpe_2": np.nan,
+                "sharpe_diff": np.nan,
+                "bootstrap_mean": np.nan,
+                "bootstrap_std": np.nan,
+                "p_value": np.nan,
+                "periods": n,
+            }
+        )
+
+    sr1 = _compute_sharpe_ratio(
+        aligned[model_1], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
+    )
+    sr2 = _compute_sharpe_ratio(
+        aligned[model_2], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
+    )
+    observed_diff = sr1 - sr2
+
+    rng = np.random.default_rng(random_state)
+    boot_diffs = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        sample_idx = rng.integers(0, n, size=n)
+        sampled = aligned.iloc[sample_idx]
+        boot_sr1 = _compute_sharpe_ratio(
+            sampled[model_1], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
+        )
+        boot_sr2 = _compute_sharpe_ratio(
+            sampled[model_2], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
+        )
+        boot_diffs[i] = boot_sr1 - boot_sr2
+
+    greater = np.mean(boot_diffs >= observed_diff)
+    lower = np.mean(boot_diffs <= observed_diff)
+    p_value = 2 * min(greater, lower)
+
+    return pd.Series(
+        {
+            "sharpe_1": sr1,
+            "sharpe_2": sr2,
+            "sharpe_diff": observed_diff,
+            "bootstrap_mean": boot_diffs.mean(),
+            "bootstrap_std": boot_diffs.std(ddof=1),
+            "p_value": p_value,
+            "periods": n,
+        }
+    )

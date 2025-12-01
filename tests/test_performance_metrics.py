@@ -1,9 +1,12 @@
+import math
 import pandas as pd
 import pytest
 
 from src.performance_metrics import (
+    bootstrap_sharpe_ratio_difference,
     compute_long_short_returns,
     compute_turnover_from_weights,
+    jobson_korkie_test,
     summarize_portfolio_performance,
 )
 from src.portfolios import compute_decile_portfolio_weights
@@ -91,3 +94,68 @@ def test_transaction_cost_adjustment():
 
     assert metrics.loc[("model", 1), "mean_return"] == expected_mean[("model", 1)]
     assert metrics.loc[("model", 2), "mean_return"] == expected_mean[("model", 2)]
+
+def test_jobson_korkie_difference():
+    returns = pd.DataFrame(
+        {
+            "model_a": [0.02, 0.01, 0.015, 0.005, 0.018, 0.0],
+            "model_b": [0.01, 0.0, 0.005, 0.002, 0.006, -0.002],
+        },
+        index=pd.date_range("2020-01-31", periods=6, freq="ME"),
+    )
+
+    result = jobson_korkie_test(
+        returns,
+        model_1="model_a",
+        model_2="model_b",
+        risk_free_rate=0.0,
+        periods_per_year=12,
+        memmel_correction=False,
+    )
+
+    assert result["periods"] == 6
+    assert result["sharpe_diff"] == pytest.approx(2.2662684197995935)
+    assert result["jk_stat"] == pytest.approx(1.2718862228771095)
+    assert result["p_value"] == pytest.approx(0.20341354758736774)
+
+
+def test_bootstrap_sharpe_ratio_difference():
+    returns = pd.DataFrame(
+        {
+            "model_a": [0.02, 0.01, 0.015, 0.005, 0.018, 0.0],
+            "model_b": [0.01, 0.0, 0.005, 0.002, 0.006, -0.002],
+        },
+        index=pd.date_range("2020-01-31", periods=6, freq="ME"),
+    )
+
+    result = bootstrap_sharpe_ratio_difference(
+        returns,
+        model_1="model_a",
+        model_2="model_b",
+        n_bootstrap=500,
+        random_state=123,
+        risk_free_rate=0.0,
+        periods_per_year=12,
+    )
+
+    aligned = returns[["model_a", "model_b"]]
+    n = len(aligned)
+    import numpy as np
+
+    rng = np.random.default_rng(123)
+    diffs = []
+    for _ in range(500):
+        idx = rng.integers(0, n, size=n)
+        sample = aligned.iloc[idx]
+        sr1 = sample["model_a"].mean() / sample["model_a"].std(ddof=1) * math.sqrt(12)
+        sr2 = sample["model_b"].mean() / sample["model_b"].std(ddof=1) * math.sqrt(12)
+        diffs.append(sr1 - sr2)
+    boot_diffs = np.array(diffs)
+
+    assert result["periods"] == 6
+    assert result["sharpe_diff"] == pytest.approx(2.2662684197995935)
+    assert result["bootstrap_mean"] == pytest.approx(boot_diffs.mean())
+    assert result["bootstrap_std"] == pytest.approx(boot_diffs.std(ddof=1))
+    assert result["p_value"] == pytest.approx(
+        2 * min((boot_diffs >= result["sharpe_diff"]).mean(), (boot_diffs <= result["sharpe_diff"]).mean())
+    )
