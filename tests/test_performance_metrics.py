@@ -60,3 +60,34 @@ def test_turnover_from_decile_weights():
     )
 
     pd.testing.assert_frame_equal(turnover, expected_turnover)
+
+
+def test_transaction_cost_adjustment():
+    index = pd.MultiIndex.from_product(
+        [["A", "B"], pd.to_datetime(["2020-01-31", "2020-02-29"])], names=["ticker", "date"]
+    )
+    panel = pd.DataFrame({"model": [1, 2, 2, 1]}, index=index)
+
+    weights = compute_decile_portfolio_weights(panel, model_cols=["model"], n_deciles=2)
+    turnover = compute_turnover_from_weights(weights)
+
+    returns = pd.DataFrame(
+        {("model", 1): [0.02, 0.03], ("model", 2): [0.01, 0.02]},
+        index=pd.to_datetime(["2020-01-31", "2020-02-29"]),
+    )
+
+    metrics, _, _ = summarize_portfolio_performance(
+        returns,
+        turnover_weights=weights,
+        transaction_cost_bps=10,
+        risk_free_rate=0.0,
+        periods_per_year=1,
+    )
+
+    expected_cost = turnover.reindex(returns.index).fillna(0.0) * 0.001
+
+    adjusted_returns = returns - expected_cost
+    expected_mean = adjusted_returns.mean()
+
+    assert metrics.loc[("model", 1), "mean_return"] == expected_mean[("model", 1)]
+    assert metrics.loc[("model", 2), "mean_return"] == expected_mean[("model", 2)]

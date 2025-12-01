@@ -106,23 +106,41 @@ def summarize_portfolio_performance(
     decile_returns: pd.DataFrame,
     *,
     turnover_weights: pd.DataFrame | None = None,
+    transaction_cost_bps: float | None = None,
     risk_free_rate: float = 0.0,
     periods_per_year: int = 12,
     plot_path: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Summarize portfolio performance statistics and optional plots."""
+    """Summarize portfolio performance statistics and optional plots.
+    When ``turnover_weights`` and ``transaction_cost_bps`` are provided, decile
+    returns are reduced by the implied trading costs (turnover × cost per
+    trade) before computing long-short spreads and summary statistics.
+    """
 
     returns = _ensure_datetime_index(decile_returns)
 
-    if isinstance(returns.columns, pd.MultiIndex):
-        long_short = compute_long_short_returns(returns)
-        if not long_short.empty:
-            returns = pd.concat([returns, long_short], axis=1)
     turnover_summary: pd.Series | None = None
     if turnover_weights is not None:
         turnover = compute_turnover_from_weights(turnover_weights)
         turnover = _ensure_datetime_index(turnover)
         turnover_summary = turnover.mean()
+
+        if transaction_cost_bps is not None and transaction_cost_bps != 0:
+            cost_per_trade = transaction_cost_bps / 10_000
+            turnover_cost = turnover.reindex(returns.index).fillna(0.0)
+
+            adjusted = returns.copy()
+            overlapping = adjusted.columns.intersection(turnover_cost.columns)
+            if not overlapping.empty:
+                adjusted[overlapping] = adjusted[overlapping] - (
+                    turnover_cost[overlapping] * cost_per_trade
+                )
+            returns = adjusted
+
+    if isinstance(returns.columns, pd.MultiIndex):
+        long_short = compute_long_short_returns(returns)
+        if not long_short.empty:
+            returns = pd.concat([returns, long_short], axis=1)
 
     metrics: dict[object, dict[str, float]] = {}
     cumulative: dict[object, pd.Series] = {}
