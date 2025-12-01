@@ -2,7 +2,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.forecasting_metrics import compute_oos_r2, evaluate_forecasting_accuracy
+from src.forecasting_metrics import (
+    compute_oos_r2,
+    diebold_mariano_test,
+    evaluate_forecasting_accuracy,
+)
 
 
 @pytest.fixture
@@ -90,3 +94,26 @@ def test_evaluate_forecasting_accuracy_invalid_index(sample_panel):
     bad_index_df = sample_panel.reset_index()
     with pytest.raises(ValueError):
         evaluate_forecasting_accuracy(bad_index_df, realized_col="realized")
+
+def test_diebold_mariano_test(sample_panel):
+    results = diebold_mariano_test(sample_panel, realized_col="realized")
+
+    assert list(results.index.names) == ["model_1", "model_2"]
+    assert ("model_a", "model_b") in results.index
+
+    # Manual squared-error loss differentials averaged by date
+    diff_by_date = pd.Series(
+        {
+            pd.to_datetime("2020-01-01"): 0.00025 - 0.025,
+            pd.to_datetime("2020-02-01"): 0.00025 - 0.0625,
+        }
+    )
+    mean_diff = diff_by_date.mean()
+    demeaned = diff_by_date - mean_diff
+    gamma0 = (demeaned @ demeaned) / len(diff_by_date)
+    var_mean = gamma0 / len(diff_by_date)
+    expected_dm = mean_diff / np.sqrt(var_mean)
+
+    assert np.isclose(results.loc[("model_a", "model_b"), "mean_loss_diff"], mean_diff)
+    assert np.isclose(results.loc[("model_a", "model_b"), "dm_stat"], expected_dm)
+    assert results.loc[("model_a", "model_b"), "periods"] == 2
