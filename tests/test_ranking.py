@@ -7,7 +7,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-from src.ranking import RankingConfig, convert_predictions_to_rankings
+from ranking import RankingConfig, convert_predictions_to_rankings
 
 def _make_index(dates, tickers):
     return pd.MultiIndex.from_product([tickers, dates], names=["ticker", "date"])

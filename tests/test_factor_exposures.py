@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-import src.factor_exposures as fe
+import factor_exposures as fe
 
 def test_compute_factor_exposures_lagged_betas():
     dates = pd.date_range("2020-01-31", periods=5, freq="ME")
@@ -62,7 +62,7 @@ def test_compute_factor_exposures_not_enough_history_returns_empty():
     result = fe.compute_factor_exposures(returns, factors, config=config)
 
     assert result.empty
-    assert list(result.columns) == ["beta_MKT", "beta_SMB", "beta_HML"]
+    assert list(result.columns) == ["alpha_ff3", "beta_MKT", "beta_SMB", "beta_HML"]
 
 
 def test_compute_factor_exposures_requires_multiindex():

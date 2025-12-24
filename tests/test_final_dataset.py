@@ -7,7 +7,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-import src.final_dataset as final_dataset
+import final_dataset as final_dataset
 
 def _make_multiindex_frame(values, dates, tickers, col_name):
     return pd.DataFrame(

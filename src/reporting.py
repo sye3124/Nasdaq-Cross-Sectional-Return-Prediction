@@ -22,14 +22,14 @@ from performance_metrics import (
 
 
 def _format_column_label(label: object) -> str:
-    # Convert tuple labels to readable strings
+    """Format column labels for plotting."""
     if isinstance(label, tuple):
         return " - ".join(str(part) for part in label)
     return str(label)
 
 
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
-    # Make sure index is a datetime index for time-series operations
+    """Ensure DataFrame index is of datetime type."""
     result = df.copy()
     result.index = pd.to_datetime(result.index)
     return result
@@ -42,26 +42,27 @@ def _compute_rolling_sharpe(
     risk_free_rate: float,
     periods_per_year: int,
 ) -> pd.DataFrame:
-    # Compute rolling Sharpe ratio over the specified window
+    """Compute rolling Sharpe ratio for each column in returns DataFrame."""
     if window <= 0:
         raise ValueError("window must be positive")
 
     rf_per_period = risk_free_rate / periods_per_year
 
     def _calc(series: pd.Series) -> float:
-        # Sharpe = mean(excess) / std(excess) annualized
+        """Calculate Sharpe ratio for a given series of returns."""
         excess = series - rf_per_period
         volatility = excess.std(ddof=1)
+        # Avoid division by zero
         if volatility == 0 or np.isnan(volatility):
             return np.nan
         return excess.mean() / volatility * math.sqrt(periods_per_year)
 
-    ordered = _ensure_datetime_index(returns)
-    return ordered.sort_index().rolling(window=window).apply(_calc, raw=False)
+    ordered = _ensure_datetime_index(returns).sort_index()
+    return ordered.apply(lambda col: col.rolling(window=window).apply(_calc, raw=False))
 
 
 def _plot_lines(df: pd.DataFrame, *, output_path: Path, title: str, ylabel: str) -> None:
-    # Generic line plot helper
+    """Plot line chart for each column in DataFrame and save to file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(10, 6))
@@ -143,9 +144,10 @@ def compute_sharpe_significance_table(
     usable_models = list(models) if models is not None else list(returns.columns)
     results: dict[tuple[object, object], pd.Series] = {}
 
-    for model_1, model_2 in combinations(sorted(usable_models), 2):
+    # Pairwise comparisons
+    for model_1, model_2 in combinations(usable_models, 2):
         # Compute statistical test comparing Sharpe ratios
-        stats = jobson_korkie_test(
+        jk = jobson_korkie_test(
             returns,
             model_1=model_1,
             model_2=model_2,
@@ -153,8 +155,9 @@ def compute_sharpe_significance_table(
             periods_per_year=periods_per_year,
             memmel_correction=memmel_correction,
         )
-        results[(model_1, model_2)] = stats
+        results[(model_1, model_2)] = jk
 
+    # Convert results to DataFrame
     if not results:
         return pd.DataFrame()
 
@@ -178,6 +181,7 @@ def plot_rolling_sharpe(
         risk_free_rate=risk_free_rate,
         periods_per_year=periods_per_year,
     )
+    # Plot and save to file
     _plot_lines(rolling, output_path=Path(output_path), title="Rolling Sharpe", ylabel="Sharpe Ratio")
     return rolling
 
@@ -201,13 +205,22 @@ def compute_portfolio_factor_exposures(
     )
 
     # Auto-select factors named beta_*
-    candidate_factors = factor_cols or [col for col in loadings.columns if col.startswith("beta_")]
+    candidate_factors = factor_cols or [
+        col for col in loadings.columns if col.startswith("beta_") or col == "alpha_ff3"
+    ]
     candidate_factors = [c for c in candidate_factors if c in loadings.columns]
 
+    # Ensure weights index is (ticker, date)
+    w = weights.copy()
+    w.index = pd.MultiIndex.from_arrays(
+        [w.index.get_level_values("ticker"), pd.to_datetime(w.index.get_level_values("date"))],
+        names=["ticker", "date"],
+    )
+
     frames: list[pd.DataFrame] = []
-    for col in weights.columns:
-        # Each column is a portfolio's weights over time
-        series = weights[col].rename("weight")
+    for col in w.columns:
+        # Series of weights for current portfolio
+        series = w[col].rename("weight")
 
         # Align weights with factor loadings for each ticker/date
         aligned = loadings.join(series, how="inner")
@@ -285,6 +298,7 @@ def compute_feature_importance(
             min_samples_leaf=1,
         )
     )
+    # Fit model
     model = factory()
     model.fit(df[feature_cols].to_numpy(), df[target_col].to_numpy())
 

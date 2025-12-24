@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.forecasting_metrics import (
+from forecasting_metrics import (
     compute_oos_r2,
     diebold_mariano_test,
     evaluate_forecasting_accuracy,
@@ -52,10 +52,10 @@ def test_evaluate_forecasting_accuracy_summary(sample_panel):
     errors_a = aligned_a["model_a"] - aligned_a["realized"]
     expected_mae_a = errors_a.abs().mean()
     expected_mse_a = (errors_a**2).mean()
-    baseline_a = aligned_a["realized"].mean()
     sse_a = ((aligned_a["realized"] - aligned_a["model_a"]) ** 2).sum()
-    sst_a = ((aligned_a["realized"] - baseline_a) ** 2).sum()
-    expected_r2_a = 1 - sse_a / sst_a
+    ybar_t = aligned_a["realized"].groupby(level="date").transform("mean")
+    sst_a = ((aligned_a["realized"] - ybar_t) ** 2).sum()
+    expected_r2_a = 1 - sse_a / sst_a if sst_a != 0 else np.nan
 
     assert np.isclose(summary.loc["model_a", "mae"], expected_mae_a)
     assert np.isclose(summary.loc["model_a", "mse"], expected_mse_a)
@@ -101,13 +101,10 @@ def test_diebold_mariano_test(sample_panel):
     assert list(results.index.names) == ["model_1", "model_2"]
     assert ("model_a", "model_b") in results.index
 
-    # Manual squared-error loss differentials averaged by date
-    diff_by_date = pd.Series(
-        {
-            pd.to_datetime("2020-01-01"): 0.00025 - 0.025,
-            pd.to_datetime("2020-02-01"): 0.00025 - 0.0625,
-        }
-    )
+    se_a = (sample_panel["model_a"] - sample_panel["realized"]) ** 2
+    se_b = (sample_panel["model_b"] - sample_panel["realized"]) ** 2
+    diff_by_date = (se_a - se_b).groupby(level="date").mean().sort_index()
+
     mean_diff = diff_by_date.mean()
     demeaned = diff_by_date - mean_diff
     gamma0 = (demeaned @ demeaned) / len(diff_by_date)

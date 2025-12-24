@@ -14,6 +14,7 @@ BoosterType = Literal["xgboost", "lightgbm"]
 
 
 def _validate_multiindex(panel: pd.DataFrame) -> None:
+    """Ensure the DataFrame is indexed by ('ticker', 'date')."""
     if not isinstance(panel.index, pd.MultiIndex) or panel.index.names[:2] != ["ticker", "date"]:
         raise ValueError("panel must be indexed by ('ticker', 'date').")
 
@@ -58,6 +59,7 @@ class GradientBoostingConfig(CrossSectionalModelConfig):
 
 
 def _build_random_forest(cfg: RandomForestConfig) -> RandomForestRegressor:
+    """Construct a RandomForestRegressor from the given configuration."""
     return RandomForestRegressor(
         n_estimators=cfg.n_estimators,
         max_depth=cfg.max_depth,
@@ -69,6 +71,7 @@ def _build_random_forest(cfg: RandomForestConfig) -> RandomForestRegressor:
 
 
 def _require_xgboost() -> object:
+    """Ensure xgboost is installed and return the XGBRegressor class."""
     if importlib.util.find_spec("xgboost") is None:
         raise ImportError("xgboost is required to use booster='xgboost'.")
     from xgboost import XGBRegressor  # type: ignore
@@ -77,14 +80,16 @@ def _require_xgboost() -> object:
 
 
 def _require_lightgbm() -> object:
+    """Ensure lightgbm is installed and return the LGBMRegressor class."""
     if importlib.util.find_spec("lightgbm") is None:
         raise ImportError("lightgbm is required to use booster='lightgbm'.")
-    from lightgbm import LGBMRegressor  # type: ignore
-
+    from lightgbm import LGBMRegressor # type: ignore
+    
     return LGBMRegressor
 
 
 def _build_boosting_model(cfg: GradientBoostingConfig):
+    """Construct a gradient boosting model from the given configuration."""
     if cfg.booster == "xgboost":
         model_cls = _require_xgboost()
         return model_cls(
@@ -99,7 +104,7 @@ def _build_boosting_model(cfg: GradientBoostingConfig):
             reg_lambda=0.0,
             reg_alpha=0.0,
         )
-
+    
     model_cls = _require_lightgbm()
     return model_cls(
         n_estimators=cfg.n_estimators,
@@ -120,14 +125,16 @@ def _cross_sectional_predictions(
     cfg: CrossSectionalModelConfig,
     estimator_factory,
 ) -> pd.DataFrame:
+    """Fit cross-sectional models and return predictions or ranks."""
     _validate_multiindex(panel)
-
+    # Iterate over dates and fit/predict
     results: list[pd.Series] = []
     for date, df_date in panel.groupby(level="date", sort=True):
         subset = df_date[[*feature_cols, target_col]].dropna(subset=feature_cols)
         if subset.empty:
             continue
 
+        # Only train on tickers with non-missing target
         train_df = subset.dropna(subset=[target_col])
         if train_df.empty:
             continue
@@ -137,16 +144,24 @@ def _cross_sectional_predictions(
         train_y = train_df[target_col].to_numpy()
         model.fit(train_X, train_y)
 
-        preds = model.predict(train_X)
-        pred_series = pd.Series(preds, index=train_df.index, name=cfg.prediction_col)
+        # Predict for ALL tickers that have features at this date
+        pred_df = subset
+        X_pred = pred_df[list(feature_cols)].to_numpy()
+        preds = model.predict(X_pred)
+
+        # Store predictions in a Series with MultiIndex
+        pred_series = pd.Series(preds, index=pred_df.index, name=cfg.prediction_col)
         if cfg.prediction_type == "rank":
             pred_series = pred_series.groupby(level="date").rank(pct=True, method=cfg.rank_method)
+
         results.append(pred_series)
 
+    # Combine results into a single DataFrame
     if not results:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
 
+    # Concatenate and sort
     output = pd.concat(results).to_frame()
     output.index = pd.MultiIndex.from_arrays(
         [

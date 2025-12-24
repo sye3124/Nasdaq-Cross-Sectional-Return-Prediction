@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.append(str(ROOT))
 
-from src.training_scheme import WindowConfig
-from src.oos_predictions import generate_oos_predictions_all_models
+from training_scheme import WindowConfig
+from oos_predictions import generate_oos_predictions_all_models
 
 
 def _build_synthetic_panel():

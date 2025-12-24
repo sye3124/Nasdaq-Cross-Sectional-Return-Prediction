@@ -34,12 +34,14 @@ class WindowConfig:
         Name of the output column containing stored predictions.
     """
 
+    # Attributes
     min_train_months: int = 60
     max_train_months: int = 120
     expanding: bool = False
     prediction_col: str = "prediction"
 
     def __post_init__(self) -> None:
+        """Validate configuration values."""
         if self.min_train_months <= 0:
             raise ValueError("min_train_months must be positive.")
         if self.max_train_months <= 0:
@@ -51,14 +53,17 @@ class WindowConfig:
 def _ols_predict(train_X: np.ndarray, train_y: np.ndarray, test_X: np.ndarray) -> np.ndarray:
     """Fit an OLS model with an intercept and predict on ``test_X``."""
 
-    X_design = np.column_stack([np.ones(len(train_X)), train_X])
+    # Add intercept term
+    X_design = np.column_stack([np.ones(train_X.shape[0]), train_X])
     coefs, *_ = np.linalg.lstsq(X_design, train_y, rcond=None)
 
-    X_test = np.column_stack([np.ones(len(test_X)), test_X])
+    # Predict on test set
+    X_test = np.column_stack([np.ones(test_X.shape[0]), test_X])
     return X_test @ coefs
 
 
 def _validate_multiindex(panel: pd.DataFrame) -> None:
+    """Ensure the panel DataFrame is indexed by ('ticker', 'date')."""
     if not isinstance(panel.index, pd.MultiIndex) or panel.index.names[:2] != ["ticker", "date"]:
         raise ValueError("panel must be indexed by ('ticker', 'date').")
 
@@ -69,7 +74,7 @@ def rolling_oos_predictions(
     *,
     target_col: str = "next_return",
     window_config: WindowConfig | None = None,
-    model_factory: Callable[[], None] | None = None,
+    model_factory: Callable[[], object] | None = None,
 ) -> pd.DataFrame:
     """Generate rolling or expanding out-of-sample predictions."""
 
@@ -77,7 +82,7 @@ def rolling_oos_predictions(
 
     cfg = window_config or WindowConfig()
 
-    # Use DISTINCT, SORTED dates so "months" means unique months, not rows
+    # Use DISTINCT, SORTED dates so min_train_months is in "months", not rows
     dates = panel.index.get_level_values("date").unique().sort_values()
     preds: list[pd.Series] = []
 
@@ -92,16 +97,18 @@ def rolling_oos_predictions(
             train_start = max(0, idx - cfg.max_train_months)
 
         train_dates = dates[train_start:idx]
-
+        # Mask panel to those training dates
         train_mask = panel.index.get_level_values("date").isin(train_dates)
         train_df = panel.loc[train_mask]
         train_df = train_df.dropna(subset=[*feature_cols, target_col])
         if train_df.empty:
             continue
-
+        
+        # Prepare training data
         train_X = train_df[list(feature_cols)].to_numpy()
         train_y = train_df[target_col].to_numpy()
 
+        # Fit model or use OLS fallback
         if model_factory:
             model = model_factory()
             model.fit(train_X, train_y)
@@ -115,6 +122,7 @@ def rolling_oos_predictions(
         if oos_features.empty:
             continue
 
+        # Generate predictions
         oos_pred = predictor(oos_features.to_numpy())
         pred_series = pd.Series(oos_pred, index=oos_features.index, name=cfg.prediction_col)
         preds.append(pred_series)
@@ -123,6 +131,7 @@ def rolling_oos_predictions(
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
 
+    # Combine predictions
     result = pd.concat(preds).to_frame()
     result.index = pd.MultiIndex.from_arrays(
         [
@@ -132,18 +141,6 @@ def rolling_oos_predictions(
         names=["ticker", "date"],
     )
     return result.sort_index()
-
-
-__all__ = [
-    "WindowConfig",
-    "rolling_oos_predictions",
-    "RegularizedModelConfig",
-    "rolling_regularized_predictions",
-    "CandidateModel",
-    "BestPeriodModel",
-    "ModelSelectionResult",
-    "rolling_time_series_tuning",
-]
 
 
 @dataclass
@@ -167,6 +164,7 @@ class RegularizedModelConfig:
         Random seed used by stochastic solvers (lasso and elastic net).
     """
 
+    # Attributes
     model_type: Literal["lasso", "ridge", "elasticnet"] = "ridge"
     alphas: Sequence[float] = tuple(np.logspace(-4, 1, 10))
     l1_ratios: Sequence[float] | None = None
@@ -222,7 +220,7 @@ def _build_regularized_model(cfg: RegularizedModelConfig):
             alphas=cfg.alphas,
             cv=cfg.cv_folds,
             max_iter=cfg.max_iter,
-            random_state=cfg.random_state,
+            random_state=cfg.random_state, #<- for coordinate descent
         )
     else:
         base_model = ElasticNetCV(
@@ -230,7 +228,7 @@ def _build_regularized_model(cfg: RegularizedModelConfig):
             l1_ratio=cfg.l1_ratios,
             cv=cfg.cv_folds,
             max_iter=cfg.max_iter,
-            random_state=cfg.random_state,
+            random_state=cfg.random_state, #<- for coordinate descent
         )
 
     return make_pipeline(StandardScaler(), base_model)
@@ -280,9 +278,11 @@ def rolling_regularized_predictions(
         if train_df.empty:
             continue
 
+        # Prepare training data
         train_x = train_df[list(feature_cols)].to_numpy()
         train_y = train_df[target_col].to_numpy()
 
+        # Fit regularized model with CV-selected hyperparameters
         model = _build_regularized_model(model_cfg)
         model.fit(train_x, train_y)
 
@@ -291,7 +291,8 @@ def rolling_regularized_predictions(
         oos_features = oos_df[list(feature_cols)].dropna()
         if oos_features.empty:
             continue
-
+        
+        # Generate predictions
         oos_pred = model.predict(oos_features.to_numpy())
         pred_series = pd.Series(oos_pred, index=oos_features.index, name=cfg.prediction_col)
         preds.append(pred_series)
@@ -300,6 +301,7 @@ def rolling_regularized_predictions(
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
 
+    # Combine predictions
     result = pd.concat(preds).to_frame()
     result.index = pd.MultiIndex.from_arrays(
         [
@@ -312,6 +314,8 @@ def rolling_regularized_predictions(
 
 
 def _safe_mean(values: list[float], *, default: float) -> float:
+    """Compute the mean of a list, returning default if empty."""
+
     if not values:
         return default
     return float(np.nanmean(values))
@@ -330,40 +334,54 @@ def _time_series_cv_scores(
     if len(unique_dates) <= 1:
         return {"spearman": -np.inf, "r2": -np.inf, "mae": np.inf}
 
+    # Limit splits to available months minus one
     splits = min(cv_folds, len(unique_dates) - 1)
     if splits < 2:
         return {"spearman": -np.inf, "r2": -np.inf, "mae": np.inf}
 
     splitter = TimeSeriesSplit(n_splits=splits)
 
+    # Store per-fold scores
     spearman_scores: list[float] = []
     r2_scores: list[float] = []
     mae_scores: list[float] = []
 
+    # Time-series CV loop
     for train_idx, val_idx in splitter.split(unique_dates):
         train_dates = unique_dates[train_idx]
         val_dates = unique_dates[val_idx]
 
+        # Mask data to training/validation dates
         fit_mask = train_df.index.get_level_values("date").isin(train_dates)
         val_mask = train_df.index.get_level_values("date").isin(val_dates)
 
         fit_df = train_df.loc[fit_mask]
         val_df = train_df.loc[val_mask]
 
+        # Skip fold if no data
         if fit_df.empty or val_df.empty:
             continue
 
         model = model_factory()
         model.fit(fit_df[list(feature_cols)].to_numpy(), fit_df[target_col].to_numpy())
 
+        # Validation predictions
         val_x = val_df[list(feature_cols)].to_numpy()
         val_y = val_df[target_col].to_numpy()
         preds = model.predict(val_x)
 
-        spearman = stats.spearmanr(val_y, preds).correlation
+        # Spearman by month
+        val_tmp = val_df.copy()
+        val_tmp["_pred"] = preds
+        by_month = val_tmp.groupby(level="date").apply(
+            lambda g: stats.spearmanr(g[target_col].to_numpy(), g["_pred"].to_numpy()).correlation
+        )
+        spearman = float(np.nanmean(by_month.to_numpy()))
+
         r2 = r2_score(val_y, preds) if len(val_y) > 1 else np.nan
         mae = mean_absolute_error(val_y, preds)
 
+        # Store fold scores, handling NaNs
         spearman_scores.append(np.nan_to_num(spearman, nan=-np.inf))
         r2_scores.append(np.nan_to_num(r2, nan=-np.inf))
         mae_scores.append(mae)
@@ -399,10 +417,12 @@ def rolling_time_series_tuning(
     _validate_multiindex(panel)
     cfg = window_config or WindowConfig()
 
+    # Use DISTINCT, SORTED dates so min_train_months is in "months", not rows
     dates = panel.index.get_level_values("date").unique().sort_values()
     preds: list[pd.Series] = []
     best_models: dict[pd.Timestamp, BestPeriodModel] = {}
 
+    # First OOS prediction at dates[cfg.min_train_months]
     for idx in range(cfg.min_train_months, len(dates)):
         current_date = dates[idx]
 
@@ -413,11 +433,13 @@ def rolling_time_series_tuning(
         train_df = panel.loc[train_mask].dropna(subset=[*feature_cols, target_col])
         if train_df.empty:
             continue
-
+        
+        # Hyperparameter tuning via time-series CV
         best_candidate: CandidateModel | None = None
         best_scores: dict[str, float] | None = None
         best_key: tuple[float, float, float] | None = None
 
+        # Evaluate each candidate
         for candidate in candidates:
             scores = _time_series_cv_scores(train_df, feature_cols, target_col, cv_folds, candidate.factory)
             score_key = (scores["spearman"], scores["r2"], -scores["mae"])
@@ -429,7 +451,8 @@ def rolling_time_series_tuning(
 
         if best_candidate is None or best_scores is None:
             continue
-
+            
+        # Refit best model on full training data
         model = best_candidate.factory()
         model.fit(train_df[list(feature_cols)].to_numpy(), train_df[target_col].to_numpy())
 
@@ -439,11 +462,13 @@ def rolling_time_series_tuning(
             cv_scores=best_scores,
         )
 
+        # OOS features at current_date
         oos_df = panel.xs(current_date, level="date", drop_level=False)
         oos_features = oos_df[list(feature_cols)].dropna()
         if oos_features.empty:
             continue
-
+        
+        # Generate predictions
         oos_pred = model.predict(oos_features.to_numpy())
         pred_series = pd.Series(oos_pred, index=oos_features.index, name=cfg.prediction_col)
         preds.append(pred_series)
@@ -455,6 +480,7 @@ def rolling_time_series_tuning(
             best_models={},
         )
 
+    # Combine predictions
     result = pd.concat(preds).to_frame()
     result.index = pd.MultiIndex.from_arrays(
         [
@@ -464,3 +490,15 @@ def rolling_time_series_tuning(
         names=["ticker", "date"],
     )
     return ModelSelectionResult(predictions=result.sort_index(), best_models=best_models)
+
+
+__all__ = [
+    "WindowConfig",
+    "rolling_oos_predictions",
+    "RegularizedModelConfig",
+    "rolling_regularized_predictions",
+    "CandidateModel",
+    "BestPeriodModel",
+    "ModelSelectionResult",
+    "rolling_time_series_tuning",
+]

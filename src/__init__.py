@@ -1,4 +1,5 @@
 from .factor_exposures import ExposureConfig, compute_factor_exposures
+from .features import FeatureConfig, compute_features
 from .linear_models import CrossSectionalOLSConfig, cross_sectional_ols
 from .forecasting_metrics import compute_oos_r2, evaluate_forecasting_accuracy
 from .oos_predictions import generate_oos_predictions_all_models
@@ -14,6 +15,8 @@ from .tree_models import (
 __all__ = [
     "ExposureConfig",
     "compute_factor_exposures",
+    "FeatureConfig",
+    "compute_features",
     "CrossSectionalOLSConfig",
     "cross_sectional_ols",
     "RandomForestConfig",

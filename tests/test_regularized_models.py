@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-from src.training_scheme import (
+from training_scheme import (
     RegularizedModelConfig,
     WindowConfig,
     rolling_regularized_predictions,

@@ -18,11 +18,14 @@ from training_scheme import (
 
 
 def _concat_predictions(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate several out-of-sample prediction DataFrames."""
     usable = [df for df in frames if not df.empty]
+    # If no DataFrame has usable predictions, return an empty DataFrame
     if not usable:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(index=empty_index)
 
+    # Concatenate along columns, aligning on the multi-index
     combined = pd.concat(usable, axis=1, join="outer")
     combined.index = pd.MultiIndex.from_arrays(
         [
@@ -79,12 +82,14 @@ def generate_oos_predictions_all_models(
 
     cfg = window_config or WindowConfig()
 
+    # Create specialized window configs for each model's prediction column
     ols_cfg = replace(cfg, prediction_col="ols_pred")
     ridge_cfg = replace(cfg, prediction_col="ridge_pred")
     lasso_cfg = replace(cfg, prediction_col="lasso_pred")
     enet_cfg = replace(cfg, prediction_col="elasticnet_pred")
     rf_cfg = replace(cfg, prediction_col="random_forest_pred")
 
+    # Regularized model configurations
     ridge_model_cfg = RegularizedModelConfig(model_type="ridge", cv_folds=3)
     lasso_model_cfg = RegularizedModelConfig(model_type="lasso", cv_folds=3)
     enet_model_cfg = RegularizedModelConfig(
@@ -93,54 +98,58 @@ def generate_oos_predictions_all_models(
         cv_folds=3,
     )
 
+    # Random forest model factory
     rf_factory = lambda: RandomForestRegressor(
-        n_estimators=200,
-        max_depth=None,
-        min_samples_leaf=1,
+        n_estimators=500,
+        max_depth=6,
+        min_samples_leaf=20,
+        max_features="sqrt",
         bootstrap=True,
         random_state=0,
         n_jobs=-1,
     )
 
+    # Generate and aggregate out-of-sample predictions
     predictions = _concat_predictions(
         [
             rolling_oos_predictions(
                 panel,
                 feature_cols,
                 target_col=target_col,
-                window_config=ols_cfg,
+                window_config=ols_cfg, # OLS fallback
             ),
             rolling_regularized_predictions(
                 panel,
                 feature_cols,
                 target_col=target_col,
                 window_config=ridge_cfg,
-                model_config=ridge_model_cfg,
+                model_config=ridge_model_cfg, # Ridge regression
             ),
             rolling_regularized_predictions(
                 panel,
                 feature_cols,
                 target_col=target_col,
                 window_config=lasso_cfg,
-                model_config=lasso_model_cfg,
+                model_config=lasso_model_cfg, # Lasso regression
             ),
             rolling_regularized_predictions(
                 panel,
                 feature_cols,
                 target_col=target_col,
                 window_config=enet_cfg,
-                model_config=enet_model_cfg,
+                model_config=enet_model_cfg, # Elastic net regression
             ),
             rolling_oos_predictions(
                 panel,
                 feature_cols,
                 target_col=target_col,
                 window_config=rf_cfg,
-                model_factory=rf_factory,
+                model_factory=rf_factory, # Random forest regression
             ),
         ]
     )
 
+    # Prepare realized returns
     realized = panel[[target_col]].rename(columns={target_col: realized_col})
     realized.index = pd.MultiIndex.from_arrays(
         [realized.index.get_level_values("ticker"), pd.to_datetime(realized.index.get_level_values("date"))],
@@ -149,10 +158,12 @@ def generate_oos_predictions_all_models(
 
     merged = predictions.join(realized, how="inner")
 
+    # Drop rows where all model predictions are NaN
     prediction_cols = [col for col in merged.columns if col != realized_col]
     merged = merged.dropna(subset=prediction_cols, how="all")
     merged = merged.sort_index()
 
+    # Save to CSV if an output path is provided
     if output_path is not None:
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -38,6 +38,7 @@ class RankingConfig:
         percentile ranks.
     """
 
+    # Default configuration values
     prediction_col: str = "prediction"
     output_col: str = "prediction_rank"
     basis: PredictionBasis = "return"
@@ -47,6 +48,7 @@ class RankingConfig:
     rank_method: str = "average"
 
     def __post_init__(self) -> None:
+        """Validate configuration values after initialization."""
         if self.basis not in {"return", "zscore"}:
             raise ValueError("basis must be 'return' or 'zscore'.")
         if self.risk_adjust not in {"volatility", "beta", None}:
@@ -58,16 +60,19 @@ class RankingConfig:
 
 
 def _validate_multiindex(df: pd.DataFrame) -> None:
+    """Validate that the DataFrame is multi-indexed by ('ticker', 'date')."""
     if not isinstance(df.index, pd.MultiIndex) or df.index.names[:2] != ["ticker", "date"]:
         raise ValueError("predictions must be indexed by ('ticker', 'date').")
 
 
 def _cross_sectional_zscore(series: pd.Series) -> pd.Series:
+    """Compute cross-sectional z-scores per date."""
     grouped = series.groupby(level="date")
     mean = grouped.transform("mean")
-    std = grouped.transform("std").replace(0, np.nan)
-    zscore = (series - mean) / std
-    return zscore.fillna(0.0)
+    std = grouped.transform(lambda x: x.std(ddof=0))
+    std = std.replace(0, np.nan)
+    z = (series - mean) / std
+    return z.fillna(0.0)
 
 
 def convert_predictions_to_rankings(
@@ -97,14 +102,17 @@ def convert_predictions_to_rankings(
     _validate_multiindex(predictions)
     cfg = config or RankingConfig()
 
+    # Extract prediction series and drop missing values
     if cfg.prediction_col not in predictions.columns:
         raise KeyError(f"Missing prediction column '{cfg.prediction_col}'.")
 
+    # Drop NaNs in prediction column
     pred_series = predictions[cfg.prediction_col].dropna()
     if pred_series.empty:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.output_col], index=empty_index)
 
+    # Apply risk adjustment if specified
     if cfg.risk_adjust == "volatility":
         adjust_col = cfg.volatility_col or ""
     elif cfg.risk_adjust == "beta":
@@ -112,6 +120,7 @@ def convert_predictions_to_rankings(
     else:
         adjust_col = None
 
+    # Perform risk adjustment
     if adjust_col:
         if adjust_col not in predictions.columns:
             raise KeyError(f"Missing risk adjustment column '{adjust_col}'.")
@@ -120,13 +129,17 @@ def convert_predictions_to_rankings(
         if combined.empty:
             empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
             return pd.DataFrame(columns=[cfg.output_col], index=empty_index)
-        pred_series = combined[cfg.prediction_col] / combined[adjust_col]
+        den = combined[adjust_col].replace(0, np.nan)
+        pred_series = combined[cfg.prediction_col] / den
+        pred_series = pred_series.replace([np.inf, -np.inf], np.nan).dropna()
 
+    # Compute scoring series based on basis
     if cfg.basis == "zscore":
         scoring_series = _cross_sectional_zscore(pred_series)
     else:
         scoring_series = pred_series
 
+    # Compute percentile ranks per date
     ranks = scoring_series.groupby(level="date").rank(pct=True, method=cfg.rank_method)
     output = ranks.rename(cfg.output_col).to_frame()
     output.index = pd.MultiIndex.from_arrays(

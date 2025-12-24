@@ -7,7 +7,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-from src.linear_models import CrossSectionalOLSConfig, cross_sectional_ols
+from linear_models import CrossSectionalOLSConfig, cross_sectional_ols
 
 
 def _make_panel():

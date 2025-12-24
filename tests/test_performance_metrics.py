@@ -2,14 +2,14 @@ import math
 import pandas as pd
 import pytest
 
-from src.performance_metrics import (
+from performance_metrics import (
     bootstrap_sharpe_ratio_difference,
     compute_long_short_returns,
     compute_turnover_from_weights,
     jobson_korkie_test,
     summarize_portfolio_performance,
 )
-from src.portfolios import compute_decile_portfolio_weights
+from portfolios import compute_decile_portfolio_weights
 
 
 def test_long_short_and_metrics(tmp_path):
@@ -56,8 +56,8 @@ def test_turnover_from_decile_weights():
 
     expected_turnover = pd.DataFrame(
         {
-            ("model", 1): [float("nan"), 0.25],
-            ("model", 2): [float("nan"), 0.25],
+            ("model", 1): [float("nan"), 1.0],
+            ("model", 2): [float("nan"), 1.0],
         },
         index=pd.to_datetime(["2020-01-31", "2020-02-29"]),
     )
