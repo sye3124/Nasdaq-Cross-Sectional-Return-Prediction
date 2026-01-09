@@ -13,40 +13,26 @@ ProfitabilityMethod = Literal["rolling_sharpe", "return_over_volatility"]
 
 @dataclass
 class FeatureConfig:
-    """Configuration for characteristic computation.
+    """Parameters controlling how each characteristic is computed.
 
-    Attributes
-    ----------
-    price_col : str
-        Column containing close or adjusted-close prices.
-    volume_col : str
-        Column containing daily share volume.
-    return_col : str | None
-        Optional column containing daily returns. When omitted, returns are
-        inferred from ``price_col``.
-    value_method : {"moving_average", "long_term_reversal"}
-        Choice of value proxy. ``"moving_average"`` computes the negative
-        price-to-12-month moving-average ratio, while ``"long_term_reversal"``
-        uses negative cumulative returns from months ``t-60`` to ``t-13``.
-    profitability_method : {"rolling_sharpe", "return_over_volatility"}
-        Choice of profitability proxy. ``"rolling_sharpe"`` uses the 12-month
-        rolling Sharpe ratio of monthly returns; ``"return_over_volatility"``
-        divides 12-month cumulative returns by 12-month volatility.
-    volatility_window_days : int
-        Length of the rolling window (in trading days) for realized volatility.
-    volatility_min_days : int
-        Minimum daily observations required before emitting a volatility
-        estimate.
-    momentum_min_months : int
-        Minimum history required to compute momentum (default 6 months).
-    value_min_months : int
-        Minimum history required for value proxies (default 6 months).
-    reversal_min_months : int
-        Minimum history required for long-term reversal (default 24 months).
-    profitability_min_months : int
-        Minimum history required for profitability metrics (default 6 months).
-    investment_min_months : int
-        Minimum history required before computing investment.
+    This module builds a set of monthly, cross-sectional features from daily
+    price/volume inputs. Most features are defined using trailing windows and/or
+    lagged inputs so they are usable as predictors without peeking into the
+    current month.
+
+    Notes on the feature definitions
+    --------------------------------
+    - dollar_volume: log(price * volume) at month end, then lagged by one month
+    - value:
+        * "moving_average": -(price / 12m moving average of price)
+        * "long_term_reversal": - cumulative return from t-60 to t-13
+    - momentum: cumulative return from t-12 to t-2 (skips the most recent month)
+    - volatility: annualized realized volatility from daily returns (month-end),
+      then lagged by one month
+    - investment: change in log(12m average monthly volume)
+    - profitability:
+        * "rolling_sharpe": 12m mean / 12m std of lagged monthly returns
+        * "return_over_volatility": 12m cumulative return / lagged 12m volatility
     """
 
     price_col: str = "adj_close"
@@ -63,6 +49,7 @@ class FeatureConfig:
     investment_min_months: int = 6
 
     def __post_init__(self) -> None:
+        # Keep config mistakes loud and early.
         if self.value_method not in {"moving_average", "long_term_reversal"}:
             raise ValueError("value_method must be 'moving_average' or 'long_term_reversal'.")
         if self.profitability_method not in {"rolling_sharpe", "return_over_volatility"}:
@@ -74,27 +61,32 @@ class FeatureConfig:
 
 
 def _validate_multiindex(df: pd.DataFrame) -> None:
+    """Ensure the input panel is indexed by ('ticker', 'date')."""
     if not isinstance(df.index, pd.MultiIndex) or df.index.names[:2] != ["ticker", "date"]:
         raise ValueError("Input data must use a MultiIndex with levels ('ticker', 'date').")
 
 
 def _cumulative_return(window: pd.Series) -> float:
+    """Compound returns over the window into a single cumulative return."""
     return float(np.prod(1 + window) - 1)
 
 
 def _compute_dollar_volume(price: pd.Series, volume: pd.Series) -> pd.Series:
+    """Compute log dollar volume, treating non-positive values as missing."""
     dollar_vol = price * volume
     dollar_vol = dollar_vol.where(dollar_vol > 0)
     return np.log(dollar_vol)
 
 
 def _compute_value(price: pd.Series, monthly_return: pd.Series, config: FeatureConfig) -> pd.Series:
+    """Compute the chosen value proxy on monthly data."""
     if config.value_method == "moving_average":
+        # Cheapness proxy: price relative to its trailing 12-month average.
         moving_avg = price.rolling(12, min_periods=config.value_min_months).mean()
         divisor = moving_avg.replace(0, np.nan)
         return -(price / divisor)
 
-    # Long-term reversal: negative cumulative returns from t-60 to t-13
+    # Long-term reversal: negative cumulative return from months t-60 to t-13.
     reversal = (
         (1 + monthly_return.shift(13))
         .rolling(48, min_periods=config.reversal_min_months)
@@ -104,7 +96,7 @@ def _compute_value(price: pd.Series, monthly_return: pd.Series, config: FeatureC
 
 
 def _compute_momentum(monthly_return: pd.Series, config: FeatureConfig) -> pd.Series:
-    # Cumulative return over months t-12:t-2 (skip t-1)
+    """Compute momentum as cumulative return from t-12 to t-2 (skip t-1)."""
     return (
         (1 + monthly_return.shift(2))
         .rolling(11, min_periods=config.momentum_min_months)
@@ -113,9 +105,9 @@ def _compute_momentum(monthly_return: pd.Series, config: FeatureConfig) -> pd.Se
 
 
 def _compute_volatility(daily_return: pd.Series, config: FeatureConfig) -> pd.Series:
+    """Compute annualized realized volatility from daily returns."""
     realized_vol = (
-        daily_return
-        .rolling(config.volatility_window_days, min_periods=config.volatility_min_days)
+        daily_return.rolling(config.volatility_window_days, min_periods=config.volatility_min_days)
         .std(ddof=0)
         * np.sqrt(252)
     )
@@ -123,6 +115,7 @@ def _compute_volatility(daily_return: pd.Series, config: FeatureConfig) -> pd.Se
 
 
 def _compute_investment(monthly_volume: pd.Series, config: FeatureConfig) -> pd.Series:
+    """Proxy investment with the change in log trailing-average trading activity."""
     avg_volume = monthly_volume.rolling(12, min_periods=config.investment_min_months).mean()
     log_avg_volume = np.log(avg_volume.replace(0, np.nan))
     return log_avg_volume.diff()
@@ -133,6 +126,8 @@ def _compute_profitability(
     monthly_volatility: pd.Series,
     config: FeatureConfig,
 ) -> pd.Series:
+    """Compute the chosen profitability proxy using monthly inputs."""
+    # Use lagged monthly returns so the feature is known at the start of month t.
     lagged = monthly_return.shift(1)
 
     if config.profitability_method == "rolling_sharpe":
@@ -149,23 +144,31 @@ def _compute_profitability(
     divisor = monthly_volatility.replace(0, np.nan)
     return cumulative / divisor
 
+
 def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) -> pd.DataFrame:
-    """Compute cross-sectional characteristics from price and volume data.
+    """Turn daily price/volume panels into monthly cross-sectional features.
+
+    The input is a daily panel indexed by (ticker, date). Each ticker is
+    resampled to month-end ("ME") and features are computed on those monthly
+    series. Where appropriate, inputs are shifted so the feature at month t
+    only uses information available through month t-1.
 
     Parameters
     ----------
-    raw : pd.DataFrame
-        Multi-indexed by ``('ticker', 'date')`` with columns for price,
-        volume, and optional daily returns.
-    config : FeatureConfig, optional
-        Controls column names and method choices for value and profitability.
+    raw
+        Daily panel indexed by ``('ticker', 'date')`` containing at least price
+        and volume columns.
+    config
+        Optional configuration controlling column names, window lengths, and
+        which value/profitability definitions to use.
 
     Returns
     -------
     pd.DataFrame
-        Multi-indexed by ``('ticker', 'date')`` containing columns ``dollar_volume``,
-        ``value``, ``momentum``, ``volatility``, ``investment``, and
-        ``profitability``. Rows where all features are missing are dropped.
+        Monthly panel indexed by ``('ticker', 'date')`` with columns:
+        ``dollar_volume``, ``value``, ``momentum``, ``volatility``,
+        ``investment``, and ``profitability``. Rows where every feature is
+        missing are removed.
     """
 
     _validate_multiindex(raw)
@@ -178,6 +181,7 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
 
     results: list[pd.DataFrame] = []
 
+    # Compute features one ticker at a time to keep indexing and resampling clean.
     for ticker, df_ticker in raw.groupby(level="ticker", sort=True):
         df_sorted = df_ticker.droplevel("ticker").sort_index()
         df_sorted.index = pd.to_datetime(df_sorted.index)
@@ -185,6 +189,7 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
         price = df_sorted[cfg.price_col]
         volume = df_sorted[cfg.volume_col]
 
+        # Use provided returns if available; otherwise compute simple returns from price.
         if cfg.return_col and cfg.return_col in df_sorted.columns:
             daily_ret = df_sorted[cfg.return_col].copy()
         else:
@@ -192,21 +197,19 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
 
         realized_daily_vol = _compute_volatility(daily_ret, cfg)
 
-        # Month-end series (use one convention everywhere)
+        # Convert daily inputs to month-end series (single convention across all features).
         monthly_price = price.resample("ME").last()
         monthly_volume = volume.resample("ME").mean()
         monthly_return = monthly_price.pct_change(fill_method=None)
-        monthly_volatility = realized_daily_vol.resample("ME").last()
-        monthly_volatility = monthly_volatility.shift(1)
 
-        # Characteristics
-        dollar_volume = _compute_dollar_volume(monthly_price, monthly_volume)
-        dollar_volume = dollar_volume.shift(1)
+        # Volatility is taken at month end and then lagged one month.
+        monthly_volatility = realized_daily_vol.resample("ME").last().shift(1)
+
+        # Core characteristics (most are already defined in lag-safe ways).
+        dollar_volume = _compute_dollar_volume(monthly_price, monthly_volume).shift(1)
         value = _compute_value(monthly_price, monthly_return, cfg)
         momentum = _compute_momentum(monthly_return, cfg)
         investment = _compute_investment(monthly_volume, cfg)
-
-        # Profitability (both methods now use consistent inputs)
         profitability = _compute_profitability(monthly_return, monthly_volatility, cfg)
 
         features = pd.DataFrame(
@@ -216,25 +219,28 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
                 "momentum": momentum,
                 "volatility": monthly_volatility,
                 "investment": investment,
+                "profitability": profitability,
             }
         )
 
-        features["profitability"] = profitability
         features["ticker"] = ticker
         features = features.set_index("ticker", append=True).reorder_levels(["ticker", "date"])
         results.append(features)
 
+    # Preserve schema even when there are no tickers / no output.
     if not results:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
-        return pd.DataFrame(columns=[
-            "dollar_volume",
-            "value",
-            "momentum",
-            "volatility",
-            "investment",
-            "profitability",
-        ], index=empty_index)
-
+        return pd.DataFrame(
+            columns=[
+                "dollar_volume",
+                "value",
+                "momentum",
+                "volatility",
+                "investment",
+                "profitability",
+            ],
+            index=empty_index,
+        )
 
     features_db = pd.concat(results).sort_index()
     features_db.index = features_db.index.set_names(["ticker", "date"])
@@ -242,4 +248,7 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
     return features_db.dropna(how="all")
 
 
-__all__ = ["FeatureConfig", "compute_features"]
+__all__ = [
+    "FeatureConfig", 
+    "compute_features"
+]

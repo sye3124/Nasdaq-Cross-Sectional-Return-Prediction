@@ -1,4 +1,16 @@
-"""Performance metrics for decile portfolios and long-short spreads."""
+"""Performance reporting for decile portfolios and long/short spreads.
+
+This module focuses on the “portfolio layer” of the pipeline: given time series
+of decile portfolio returns (often produced from model ranks), it can:
+
+- compute top-minus-bottom long/short returns per model
+- compute turnover from portfolio weights
+- apply simple transaction-cost adjustments (bps × turnover)
+- summarize performance (annualized mean, vol, Sharpe, drawdowns, turnover)
+- optionally plot cumulative returns
+- compare Sharpe ratios across models (Jobson–Korkie / bootstrap)
+"""
+
 from __future__ import annotations
 
 import math
@@ -13,8 +25,35 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def _safe_sort_decile_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort MultiIndex columns (model, decile) in a way that won't break selection.
+
+    We sort:
+    - model level alphabetically
+    - numeric deciles ascending
+    - everything else (e.g. "LS"/"long_short") after numeric deciles
+
+    This avoids a handful of pandas edge cases where partially sorted MultiIndex
+    columns can trigger KeyErrors during slicing / plotting.
+    """
+    if not isinstance(df.columns, pd.MultiIndex) or df.columns.nlevels != 2:
+        return df
+
+    cols = list(df.columns)
+    models = sorted(set(m for m, _ in cols))
+
+    ordered_cols: list[tuple[object, object]] = []
+    for m in models:
+        level2 = [d for mm, d in cols if mm == m]
+        numeric = sorted([d for d in level2 if isinstance(d, (int, np.integer))])
+        other = [d for d in level2 if not isinstance(d, (int, np.integer))]
+        ordered_cols.extend([(m, d) for d in numeric + other])
+
+    return df.loc[:, ordered_cols]
+
+
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure the DataFrame index is a DatetimeIndex."""
+    """Return a copy with the index coerced to DatetimeIndex."""
     result = df.copy()
     result.index = pd.to_datetime(result.index)
     return result
@@ -25,37 +64,75 @@ def compute_long_short_returns(
     *,
     bottom_decile: int = 1,
     top_decile: int | None = None,
+    cap: float | None = None,
 ) -> pd.DataFrame:
-    """Construct long-short returns from top minus bottom deciles for each model.
+    """Build top-minus-bottom long/short returns for each model.
 
-    Robust to extra columns like 'LS' by using only numeric decile columns.
+    The input is expected to have columns like (model, 1), (model, 2), ... where
+    the second level is the decile number. Non-numeric second-level entries are
+    ignored.
+
+    Parameters
+    ----------
+    decile_returns
+        DataFrame indexed by date with MultiIndex columns (model, decile).
+    bottom_decile
+        Which decile to treat as "short" (default: 1).
+    top_decile
+        Which decile to treat as "long". If None, uses the largest decile found.
+    cap
+        Optional cap applied to the long/short spread each period (winsor-like
+        clipping), useful for stabilizing plots.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with MultiIndex columns (model, "long_short"). Empty if inputs
+        are empty or no valid deciles are found.
     """
-
-    # Validate input
     if not isinstance(decile_returns, pd.DataFrame):
         raise TypeError("decile_returns must be a DataFrame")
-    if not isinstance(decile_returns.columns, pd.MultiIndex):
-        raise ValueError("decile_returns must have MultiIndex columns (model, decile)")
+    if decile_returns.empty:
+        return pd.DataFrame()
 
-    out: dict[tuple[str, str], pd.Series] = {}
+    # Make sure columns are truly a 2-level MultiIndex; accept list-of-tuples too.
+    cols = decile_returns.columns
+    if not isinstance(cols, pd.MultiIndex):
+        if len(cols) > 0 and all(isinstance(c, tuple) and len(c) == 2 for c in cols):
+            decile_returns = decile_returns.copy()
+            decile_returns.columns = pd.MultiIndex.from_tuples(cols)
+        else:
+            raise ValueError("decile_returns must have MultiIndex columns (model, decile)")
 
-    # For each model, compute long-short returns
-    for model in decile_returns.columns.get_level_values(0).unique():
-        subset = decile_returns[model]
-        if subset.empty:
-            continue
+    out: dict[tuple[object, str], pd.Series] = {}
 
-        # Keep only numeric decile columns (ignore 'LS' or any non-numeric labels)
-        numeric_deciles = [c for c in subset.columns if isinstance(c, (int, np.integer))]
+    model_level = decile_returns.columns.get_level_values(0)
+    decile_level = decile_returns.columns.get_level_values(1)
+
+    for model in pd.unique(model_level):
+        numeric_deciles = sorted(
+            {d for d in decile_level[model_level == model] if isinstance(d, (int, np.integer))}
+        )
         if not numeric_deciles:
             continue
-        
-        # Determine bottom and top deciles to use
-        bot = bottom_decile if bottom_decile in numeric_deciles else min(numeric_deciles)
-        top = top_decile if (top_decile is not None and top_decile in numeric_deciles) else max(numeric_deciles)
 
-        # Compute long-short spread
-        spread = subset[top] - subset[bot]
+        bot = bottom_decile if bottom_decile in numeric_deciles else numeric_deciles[0]
+        top = (
+            top_decile
+            if (top_decile is not None and top_decile in numeric_deciles)
+            else numeric_deciles[-1]
+        )
+
+        col_bot = (model, bot)
+        col_top = (model, top)
+        if col_bot not in decile_returns.columns or col_top not in decile_returns.columns:
+            continue
+
+        spread = decile_returns[col_top] - decile_returns[col_bot]
+
+        if cap is not None:
+            spread = spread.clip(lower=-cap, upper=cap)
+
         spread.name = (model, "long_short")
         out[(model, "long_short")] = spread
 
@@ -63,12 +140,18 @@ def compute_long_short_returns(
 
 
 def compute_turnover_from_weights(weights: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-period turnover from portfolio weight changes."""
+    """Compute turnover from a panel of portfolio weights.
 
+    Turnover is computed per period as:
+
+        0.5 * sum_i |w_i,t - w_i,t-1|
+
+    The factor 0.5 avoids double-counting buys and sells for a fully-invested
+    portfolio.
+    """
     if not isinstance(weights.index, pd.MultiIndex) or weights.index.names[:2] != ["ticker", "date"]:
         raise ValueError("weights must be indexed by ('ticker', 'date')")
 
-    # Normalize index to ensure 'date' level is datetime
     normalized = weights.copy()
     normalized.index = pd.MultiIndex.from_arrays(
         [
@@ -80,41 +163,29 @@ def compute_turnover_from_weights(weights: pd.DataFrame) -> pd.DataFrame:
 
     turnovers: dict[object, pd.Series] = {}
 
-    # For each (model, decile) column, compute normalized turnover over time
     for col in normalized.columns:
-        pivot = (
-            normalized[col]
-            .unstack("ticker")
-            .fillna(0.0)
-            .sort_index()
-        )
-
-        # 0.5 * sum |Δw_i| over tickers
+        pivot = normalized[col].unstack("ticker").fillna(0.0).sort_index()
         abs_change = pivot.diff().abs()
         per_period = abs_change.sum(axis=1) * 0.5
 
-        # First period has no prior weights → turnover undefined
         if len(per_period) > 0:
             per_period.iloc[0] = np.nan
 
         turnovers[col] = per_period
 
     result = pd.DataFrame(turnovers)
-
-    # Ensure a DatetimeIndex and explicitly drop the name so it matches the tests
     result.index = pd.to_datetime(result.index)
     result.index.name = None
-
     return result
 
 
 def _annualize_stat(value: float, periods_per_year: int) -> float:
-    """Annualize a return statistic (mean return)."""
+    """Annualize a per-period mean return."""
     return value * periods_per_year
 
 
 def _annualize_vol(vol: float, periods_per_year: int) -> float:
-    """Annualize a volatility statistic."""
+    """Annualize a per-period volatility."""
     return vol * math.sqrt(periods_per_year)
 
 
@@ -126,69 +197,138 @@ def summarize_portfolio_performance(
     risk_free_rate: float = 0.0,
     periods_per_year: int = 12,
     plot_path: str | Path | None = None,
+    start_date: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Summarize portfolio performance statistics and optional plots.
-    When ``turnover_weights`` and ``transaction_cost_bps`` are provided, decile
-    returns are reduced by the implied trading costs (turnover × cost per
-    trade) before computing long-short spreads and summary statistics.
-    """
+    """Compute summary stats, cumulative performance, and drawdowns.
 
+    If turnover weights and a transaction-cost setting are provided, returns are
+    reduced by:
+
+        cost_t = turnover_t * (bps / 10_000)
+
+    Costs are applied:
+    - directly to the provided decile portfolios (matching columns), and
+    - to derived long/short portfolios using a simple proxy:
+        turnover(LS) ≈ turnover(top) + turnover(bottom)
+    """
     returns = _ensure_datetime_index(decile_returns)
 
-    # Compute turnover and adjust returns for transaction costs if provided
+    if start_date is not None:
+        returns = returns.loc[start_date:].copy()
+
+    returns = _safe_sort_decile_columns(returns)
+    returns.columns = pd.MultiIndex.from_tuples(list(returns.columns))
+
+    if isinstance(returns.columns, pd.MultiIndex):
+        returns = returns.sort_index(axis=1)
+
     turnover_summary: pd.Series | None = None
+
     if turnover_weights is not None:
         turnover = compute_turnover_from_weights(turnover_weights)
         turnover = _ensure_datetime_index(turnover)
         turnover_summary = turnover.mean()
 
-        # Adjust returns for transaction costs
         if transaction_cost_bps is not None and transaction_cost_bps != 0:
             cost_per_trade = transaction_cost_bps / 10_000
             turnover_cost = turnover.reindex(returns.index).fillna(0.0)
 
-            adjusted = returns.copy()
-            overlapping = adjusted.columns.intersection(turnover_cost.columns)
-            if not overlapping.empty:
-                adjusted[overlapping] = adjusted[overlapping] - (
-                    turnover_cost[overlapping] * cost_per_trade
+            if isinstance(returns.columns, pd.MultiIndex) and isinstance(turnover_cost.columns, pd.MultiIndex):
+                direct_cols = returns.columns.intersection(turnover_cost.columns)
+                cost_df = (
+                    turnover_cost[direct_cols].copy()
+                    if len(direct_cols) > 0
+                    else pd.DataFrame(index=returns.index)
                 )
-            returns = adjusted
+                cost_df = cost_df.reindex(columns=returns.columns).fillna(0.0)
+            else:
+                overlapping = returns.columns.intersection(turnover_cost.columns)
+                if overlapping.empty:
+                    raise ValueError(
+                        "No overlapping columns between returns and turnover_cost. "
+                        f"returns cols example: {list(returns.columns)[:5]} | "
+                        f"turnover cols example: {list(turnover_cost.columns)[:5]}"
+                    )
+                cost_df = turnover_cost.reindex(columns=overlapping).fillna(0.0)
+                cost_df = cost_df.reindex(columns=returns.columns).fillna(0.0)
 
-    # Compute long-short returns and append to returns DataFrame
+            returns = returns - cost_df * cost_per_trade
+
     if isinstance(returns.columns, pd.MultiIndex):
-        # Add long_short only if LS isn't already present
-        has_ls = any(str(d) == "LS" for d in returns.columns.get_level_values(1))
+        lvl1 = returns.columns.get_level_values(1)
+        has_ls = any(str(x).lower() in {"ls", "long_short"} for x in lvl1)
+
         if not has_ls:
             long_short = compute_long_short_returns(returns)
+
             if not long_short.empty:
+                if not isinstance(long_short.columns, pd.MultiIndex):
+                    if all(isinstance(c, tuple) and len(c) == 2 for c in long_short.columns):
+                        long_short = long_short.copy()
+                        long_short.columns = pd.MultiIndex.from_tuples(long_short.columns)
+                if isinstance(long_short.columns, pd.MultiIndex):
+                    long_short = long_short.sort_index(axis=1)
+
                 returns = pd.concat([returns, long_short], axis=1)
+                returns = returns.sort_index(axis=1)
 
+                if (
+                    turnover_weights is not None
+                    and transaction_cost_bps is not None
+                    and transaction_cost_bps != 0
+                ):
+                    cost_per_trade = transaction_cost_bps / 10_000
 
-    # Compute performance metrics
+                    turnover = compute_turnover_from_weights(turnover_weights)
+                    turnover = _ensure_datetime_index(turnover)
+                    turnover_cost = turnover.reindex(returns.index).fillna(0.0)
+
+                    if isinstance(turnover_cost.columns, pd.MultiIndex):
+                        for (model, tag) in long_short.columns:
+                            model_deciles = [
+                                d
+                                for (m, d) in turnover_cost.columns
+                                if m == model and isinstance(d, (int, np.integer))
+                            ]
+                            if not model_deciles:
+                                continue
+
+                            bottom = int(min(model_deciles))
+                            top = int(max(model_deciles))
+
+                            if (model, top) in turnover_cost.columns and (model, bottom) in turnover_cost.columns:
+                                ls_turnover = turnover_cost[(model, top)] + turnover_cost[(model, bottom)]
+                                returns[(model, tag)] = returns[(model, tag)] - (ls_turnover * cost_per_trade)
+
     metrics: dict[object, dict[str, float]] = {}
     cumulative: dict[object, pd.Series] = {}
     drawdowns: dict[object, pd.Series] = {}
 
     rf_per_period = risk_free_rate / periods_per_year
 
-    # For each portfolio (column), compute metrics
+    PLOT_RET_CLIP = (-0.9, 2.0)
+    returns = returns.clip(lower=PLOT_RET_CLIP[0], upper=PLOT_RET_CLIP[1])
+
     for col in returns.columns:
         series = returns[col].dropna()
         if series.empty:
             continue
+
         mean_return = series.mean()
         volatility = series.std(ddof=1)
+
         sharpe = np.nan
-        # Sharpe ratio
         if volatility and not np.isnan(volatility):
             sharpe = ((mean_return - rf_per_period) / volatility) * math.sqrt(periods_per_year)
+
         t_stat = np.nan
-        # T-statistic for mean return
         if volatility and len(series) > 1:
             t_stat = mean_return / (volatility / math.sqrt(len(series)))
 
-        # Cumulative returns and drawdowns
+        series = series.where(series > -0.999, np.nan).dropna()
+        if series.empty:
+            continue
+
         cum = (1.0 + series).cumprod()
         dd = cum / cum.cummax() - 1.0
 
@@ -201,15 +341,15 @@ def summarize_portfolio_performance(
             "sharpe_ratio": sharpe,
             "t_stat_mean": t_stat,
             "max_drawdown": dd.min(),
-            "avg_turnover": turnover_summary[col] if turnover_summary is not None and col in turnover_summary else np.nan,
+            "avg_turnover": (
+                turnover_summary[col] if turnover_summary is not None and col in turnover_summary else np.nan
+            ),
         }
 
-    # Convert metrics to DataFrames
     metrics_df = pd.DataFrame(metrics).T.sort_index()
     cumulative_df = pd.DataFrame(cumulative).sort_index()
     drawdown_df = pd.DataFrame(drawdowns).sort_index()
 
-    # Generate cumulative returns plot if requested
     if plot_path is not None and not cumulative_df.empty:
         _plot_cumulative_returns(cumulative_df, plot_path)
 
@@ -217,20 +357,26 @@ def summarize_portfolio_performance(
 
 
 def _format_column_label(label: object) -> str:
-    """Format column label for plotting."""
+    """Turn a (model, decile) tuple into a readable legend label."""
     if isinstance(label, tuple):
         return " - ".join(str(part) for part in label)
     return str(label)
 
 
 def _plot_cumulative_returns(cumulative: pd.DataFrame, output_path: str | Path) -> None:
-    """Plot cumulative returns and save to file."""
+    """Plot cumulative return curves and save them to disk.
+
+    Uses iloc iteration intentionally to avoid pandas MultiIndex lookup quirks.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(10, 6))
-    for col in cumulative.columns:
-        plt.plot(cumulative.index, cumulative[col], label=_format_column_label(col))
+
+    for i, col_label in enumerate(list(cumulative.columns)):
+        series = cumulative.iloc[:, i]
+        plt.plot(cumulative.index, series, label=_format_column_label(col_label))
+
     plt.title("Cumulative Returns")
     plt.xlabel("Date")
     plt.ylabel("Growth of $1")
@@ -244,7 +390,7 @@ def _plot_cumulative_returns(cumulative: pd.DataFrame, output_path: str | Path) 
 def _compute_sharpe_ratio(
     returns: pd.Series, *, risk_free_rate: float = 0.0, periods_per_year: int = 12
 ) -> float:
-    """Compute annualized Sharpe ratio for a return series."""
+    """Compute the annualized Sharpe ratio of a return series."""
     excess = returns.dropna() - risk_free_rate / periods_per_year
     volatility = excess.std(ddof=1)
     if volatility == 0 or np.isnan(volatility):
@@ -252,10 +398,8 @@ def _compute_sharpe_ratio(
     return excess.mean() / volatility * math.sqrt(periods_per_year)
 
 
-def _align_model_returns(
-    returns: pd.DataFrame, model_1: object, model_2: object
-) -> pd.DataFrame:
-    """Align returns for two models, dropping NaNs and sorting by date."""
+def _align_model_returns(returns: pd.DataFrame, model_1: object, model_2: object) -> pd.DataFrame:
+    """Align two return series on a common date index (dropping missing rows)."""
     if model_1 not in returns.columns or model_2 not in returns.columns:
         raise KeyError("Both model columns must be present in the returns DataFrame")
 
@@ -273,32 +417,10 @@ def jobson_korkie_test(
     periods_per_year: int = 12,
     memmel_correction: bool = True,
 ) -> pd.Series:
-    """Jobson-Korkie test (with optional Memmel correction) for Sharpe ratios.
-
-    Parameters
-    ----------
-    returns : pd.DataFrame
-        DataFrame with columns for each model's returns. Index is interpreted as
-        time and is coerced to ``DatetimeIndex``.
-    model_1, model_2 : hashable
-        Column labels for the two models to compare.
-    risk_free_rate : float, default 0.0
-        Annualized risk-free rate used to compute excess returns.
-    periods_per_year : int, default 12
-        Number of return observations per year.
-    memmel_correction : bool, default True
-        Apply the small-sample correction proposed by Memmel (2003).
-
-    Returns
-    -------
-    pd.Series
-        Contains the Sharpe ratios for each model, their difference, the test
-        statistic, and two-sided p-value.
-    """
-
-    # Align returns for the two models
+    """Jobson–Korkie test (optionally with Memmel correction) for Sharpe ratios."""
     aligned = _align_model_returns(returns, model_1, model_2)
     n = len(aligned)
+
     if n < 2:
         return pd.Series(
             {
@@ -311,7 +433,6 @@ def jobson_korkie_test(
             }
         )
 
-    # Compute Sharpe ratios
     sr1 = _compute_sharpe_ratio(
         aligned[model_1], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
     )
@@ -319,18 +440,14 @@ def jobson_korkie_test(
         aligned[model_2], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
     )
 
-    # Compute covariance and correlation between returns
     cov = aligned.cov(ddof=1).iloc[0, 1]
     vol1 = aligned[model_1].std(ddof=1)
     vol2 = aligned[model_2].std(ddof=1)
     rho = cov / (vol1 * vol2) if vol1 and vol2 else np.nan
 
-    # Compute variance of Sharpe ratio difference
     variance = np.nan
     if not np.isnan(rho):
-        variance = (
-            (2 * (1 - rho) * sr1 * sr2) + 0.5 * (sr1**2 + sr2**2)
-        ) / n
+        variance = ((2 * (1 - rho) * sr1 * sr2) + 0.5 * (sr1**2 + sr2**2)) / n
         if memmel_correction and n > 1:
             variance -= ((sr1 - sr2) ** 2) / (2 * (n - 1))
 
@@ -359,15 +476,10 @@ def bootstrap_sharpe_ratio_difference(
     risk_free_rate: float = 0.0,
     periods_per_year: int = 12,
 ) -> pd.Series:
-    """Bootstrap test for differences in model Sharpe ratios.
-
-    A percentile bootstrap is used to approximate the sampling distribution of
-    the Sharpe ratio difference. The function returns the observed difference,
-    bootstrap mean and standard deviation, and a two-sided p-value.
-    """
-
+    """Bootstrap a p-value for the Sharpe ratio difference between two models."""
     aligned = _align_model_returns(returns, model_1, model_2)
     n = len(aligned)
+
     if n == 0 or n_bootstrap <= 0:
         return pd.Series(
             {
@@ -381,7 +493,6 @@ def bootstrap_sharpe_ratio_difference(
             }
         )
 
-    # Compute observed Sharpe ratios and their difference
     sr1 = _compute_sharpe_ratio(
         aligned[model_1], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
     )
@@ -390,12 +501,13 @@ def bootstrap_sharpe_ratio_difference(
     )
     observed_diff = sr1 - sr2
 
-    # Bootstrap resampling
     rng = np.random.default_rng(random_state)
     boot_diffs = np.empty(n_bootstrap)
+
     for i in range(n_bootstrap):
         sample_idx = rng.integers(0, n, size=n)
         sampled = aligned.iloc[sample_idx]
+
         boot_sr1 = _compute_sharpe_ratio(
             sampled[model_1], risk_free_rate=risk_free_rate, periods_per_year=periods_per_year
         )
@@ -404,7 +516,6 @@ def bootstrap_sharpe_ratio_difference(
         )
         boot_diffs[i] = boot_sr1 - boot_sr2
 
-    # Compute p-value based on bootstrap distribution
     greater = np.mean(boot_diffs >= observed_diff)
     lower = np.mean(boot_diffs <= observed_diff)
     p_value = 2 * min(greater, lower)

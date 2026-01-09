@@ -1,4 +1,16 @@
-"""Forecasting accuracy metrics for model comparison."""
+"""Metrics for comparing forecasting models on a panel of returns.
+
+This module assumes forecasts and realized returns live in a single panel
+indexed by ``('ticker', 'date')``. One column contains realized outcomes, while
+each additional column corresponds to a model forecast.
+
+Implemented metrics include:
+- Out-of-sample R² (mean and cross-sectional baselines)
+- MAE and MSE
+- Cross-sectional Spearman rank correlations
+- Diebold–Mariano tests with Newey–West variance adjustment
+"""
+
 from __future__ import annotations
 
 from itertools import combinations
@@ -12,22 +24,28 @@ RealizedCol = str
 
 
 def _validate_multiindex(df: pd.DataFrame) -> None:
-    """Validate that the DataFrame uses a MultiIndex with levels ('ticker', 'date')."""
+    """Ensure the DataFrame is indexed by ('ticker', 'date')."""
+    # We rely heavily on grouping by ticker and date, so enforce this strictly
     if not isinstance(df.index, pd.MultiIndex) or df.index.names[:2] != ["ticker", "date"]:
         raise ValueError("predictions must be indexed by ('ticker', 'date').")
 
 
 def _validate_realized_column(df: pd.DataFrame, realized_col: RealizedCol) -> None:
-    """Validate that the realized return column exists in the DataFrame."""
+    """Ensure the realized return column exists."""
     if realized_col not in df.columns:
         raise KeyError(f"Missing realized return column '{realized_col}'.")
 
 
-def _align_predictions(
-    predictions: pd.Series, realized: pd.Series
-) -> pd.DataFrame:
-    """Align predictions and realized returns on ('ticker', 'date') index."""
+def _align_predictions(predictions: pd.Series, realized: pd.Series) -> pd.DataFrame:
+    """Align predictions with realized returns on a common index.
+
+    The function performs an inner join on ('ticker', 'date') and drops
+    observations with missing values on either side.
+    """
+    # Inner join ensures we only keep observations available for both series
     aligned = pd.concat([predictions, realized], axis=1, join="inner").dropna()
+
+    # Normalize date level to datetime for consistent downstream grouping
     aligned.index = pd.MultiIndex.from_arrays(
         [
             aligned.index.get_level_values("ticker"),
@@ -39,64 +57,74 @@ def _align_predictions(
 
 
 def compute_oos_r2(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
-    """Compute out-of-sample R² using a mean baseline."""
-
+    """Compute out-of-sample R² using the sample mean as the baseline."""
     true_series = pd.Series(y_true)
     pred_series = pd.Series(y_pred)
 
-    # Check for empty or mismatched series
+    # Guard against empty or incompatible inputs
     if true_series.empty or pred_series.empty or len(true_series) != len(pred_series):
         return np.nan
 
-    # Compute R²
+    # Sum of squared prediction errors
     errors = true_series - pred_series
     sse = (errors**2).sum()
+
+    # Baseline forecast is the unconditional mean
     baseline = true_series.mean()
     sst = ((true_series - baseline) ** 2).sum()
+
+    # If variance is zero, R² is undefined
     if sst == 0:
         return np.nan
+
     return 1 - sse / sst
 
 
 def compute_oos_r2_cs(aligned: pd.DataFrame) -> float:
-    """
-    Cross-sectional OOS R²:
-    1 - sum((y - yhat)^2) / sum((y - ybar_t)^2)
-    where ybar_t is the cross-sectional mean at each date.
-    aligned must have two columns: [pred, realized] in that order.
+    """Cross-sectional out-of-sample R² with a per-date mean benchmark.
+
+    At each date, the benchmark forecast is the cross-sectional mean of
+    realized returns for that date.
     """
     if aligned.empty:
         return np.nan
 
-    # Extract predictions and realized values
+    # First column = predictions, second = realized returns
     pred = aligned.iloc[:, 0]
     y = aligned.iloc[:, 1]
 
+    # Model sum of squared errors
     sse = ((y - pred) ** 2).sum()
 
-    # Compute cross-sectional means per date
+    # Cross-sectional baseline varies by date
     ybar_t = y.groupby(level="date").transform("mean")
     sst = ((y - ybar_t) ** 2).sum()
 
-    # Avoid division by zero
     if sst == 0:
         return np.nan
     return 1 - sse / sst
 
 
 def _monthly_spearman_rank_corr(aligned: pd.DataFrame) -> pd.Series:
-    """Compute cross-sectional Spearman correlations per date."""
+    """Compute per-date Spearman rank correlations.
 
-    results = {}
-    # aligned must have two columns: [pred, realized] in that order.
+    Spearman is implemented by ranking predictions and realized values
+    cross-sectionally, then computing a Pearson correlation of the ranks.
+    """
+    results: dict[pd.Timestamp, float] = {}
+
     for date, group in aligned.groupby(level="date"):
+        # Require at least two assets to define a correlation
         if len(group) < 2:
             continue
-        # Compute ranks
+
+        # Convert values to percentile ranks within the date
         pred_ranks = group.iloc[:, 0].rank(pct=True)
         realized_ranks = group.iloc[:, 1].rank(pct=True)
-        corr = pred_ranks.corr(realized_ranks, method="pearson")
-        results[pd.to_datetime(date)] = corr
+
+        # Pearson correlation of ranks equals Spearman correlation
+        results[pd.to_datetime(date)] = pred_ranks.corr(realized_ranks, method="pearson")
+
     return pd.Series(results).sort_index()
 
 
@@ -106,55 +134,58 @@ def evaluate_forecasting_accuracy(
     realized_col: RealizedCol = "realized_return",
     model_cols: Iterable[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Evaluate forecasting accuracy across multiple models.
+    """Evaluate forecasting accuracy for one or more models.
 
-    The function expects a multi-indexed panel keyed by ``('ticker', 'date')``
-    containing realized returns and one column per model forecast. Summary
-    metrics (out-of-sample R², MAE, MSE, and mean cross-sectional Spearman rank
-    correlation) are returned alongside a per-date Spearman series for each
-    model, enabling cross-sectional analysis.
+    For each model column, the function computes:
+    - cross-sectional OOS R²
+    - MAE and MSE
+    - mean cross-sectional Spearman rank correlation
 
-    Returns
-    -------
-    summary : pd.DataFrame
-        Rows correspond to models with columns ``['oos_r2', 'mae', 'mse',
-        'spearman_rank_corr']``.
-    spearman_by_date : pd.DataFrame
-        Rows are dates and columns are models containing daily Spearman rank
-        correlations. Empty when no valid correlations are available.
+    It also returns the full time series of Spearman correlations by date.
     """
-    # Validate inputs
+    # Basic structural validation
     _validate_multiindex(panel)
     _validate_realized_column(panel, realized_col)
 
-    # Prepare realized returns
+    # Extract realized returns and normalize the date index
     realized = panel[realized_col]
     realized.index = pd.MultiIndex.from_arrays(
-        [realized.index.get_level_values("ticker"), pd.to_datetime(realized.index.get_level_values("date"))],
+        [
+            realized.index.get_level_values("ticker"),
+            pd.to_datetime(realized.index.get_level_values("date")),
+        ],
         names=["ticker", "date"],
     )
 
-    # Determine candidate model columns
+    # Identify which columns correspond to model forecasts
     candidate_cols = [c for c in panel.columns if c != realized_col]
     if model_cols is not None:
         candidate_cols = [c for c in candidate_cols if c in set(model_cols)]
 
-    # Compute metrics for each model
     metrics: dict[str, dict[str, float]] = {}
     spearman_frames: list[pd.Series] = []
 
-    # Process each model column
     for col in candidate_cols:
+        # Align predictions with realized returns
         aligned = _align_predictions(panel[col], realized)
         if aligned.empty:
-            metrics[col] = {"oos_r2": np.nan, "mae": np.nan, "mse": np.nan, "spearman_rank_corr": np.nan}
+            metrics[col] = {
+                "oos_r2": np.nan,
+                "mae": np.nan,
+                "mse": np.nan,
+                "spearman_rank_corr": np.nan,
+            }
             continue
 
+        # Pointwise forecast errors
         errors = aligned.iloc[:, 0] - aligned.iloc[:, 1]
         mae = errors.abs().mean()
         mse = (errors**2).mean()
+
+        # Cross-sectional R²
         r2 = compute_oos_r2_cs(aligned)
 
+        # Cross-sectional rank correlations by date
         daily_spearman = _monthly_spearman_rank_corr(aligned)
         spearman_mean = daily_spearman.mean()
 
@@ -164,14 +195,14 @@ def evaluate_forecasting_accuracy(
             "mse": mse,
             "spearman_rank_corr": spearman_mean,
         }
-        # Collect daily Spearman series
+
+        # Keep full time series for optional diagnostics
         if not daily_spearman.empty:
             spearman_frames.append(daily_spearman.rename(col))
 
     summary = pd.DataFrame(metrics).T
     summary.index.name = "model"
 
-    # Combine per-date Spearman correlations
     spearman_by_date = pd.concat(spearman_frames, axis=1) if spearman_frames else pd.DataFrame()
     spearman_by_date.index = pd.to_datetime(spearman_by_date.index)
 
@@ -184,26 +215,9 @@ def _newey_west_variance(
     *,
     test_mode: bool = False,
 ) -> float:
-    """Estimate variance of the mean loss differential using Newey-West.
+    """Estimate the variance of the mean loss differential using Newey–West.
 
-    This returns an estimate of Var( mean(d_t) ), where d_t is the (time-series)
-    loss differential (already aggregated to one value per date).
-
-    Parameters
-    ----------
-    differences : pd.Series
-        Time series of loss differentials indexed by date (or sortable index).
-    lag : int
-        Newey-West truncation lag (0 means no autocorrelation adjustment).
-    test_mode : bool, optional
-        When True, applies a small-sample scaling factor so a specific unit-test
-        benchmark matches a manual reference calculation. For empirical work,
-        keep this False to use the standard Newey-West estimator.
-
-    Returns
-    -------
-    float
-        Estimated variance of the sample mean of differences.
+    The input series should already be aggregated to one observation per date.
     """
     n = int(len(differences))
     if n == 0:
@@ -211,25 +225,24 @@ def _newey_west_variance(
     if lag < 0:
         raise ValueError("lag must be >= 0")
 
+    # Convert to float and remove the mean
     d = differences.astype(float)
-
-    # Demean
     u = d - d.mean()
 
-    # gamma_0
+    # Zero-lag autocovariance
     var = float((u @ u) / n)
 
-    # Add weighted autocovariances
+    # Add weighted autocovariances up to the truncation lag
     max_lag = min(int(lag), n - 1)
     for k in range(1, max_lag + 1):
         weight = 1.0 - k / (max_lag + 1.0)
         cov = float((u.iloc[k:].to_numpy() @ u.iloc[:-k].to_numpy()) / n)
         var += 2.0 * weight * cov
 
-    # Variance of the sample mean
+    # Convert variance of the series into variance of the sample mean
     var_mean = var / n
 
-    # Optional test calibration (kept isolated and explicit)
+    # Optional scaling used only to match unit-test reference values
     if test_mode:
         var_mean = var_mean / 4.0
 
@@ -245,45 +258,12 @@ def diebold_mariano_test(
     horizon: int = 1,
     test_mode: bool = False,
 ) -> pd.DataFrame:
-    """Perform Diebold-Mariano tests for all model pairs.
+    """Perform Diebold–Mariano tests for all pairs of model forecasts.
 
-    The implementation computes per-date forecast losses, averages them across
-    tickers, and applies a Diebold-Mariano test to the resulting loss
-    differential time series. Losses default to squared errors but can also use
-    absolute errors.
-
-    Parameters
-    ----------
-    panel : pd.DataFrame
-        Multi-indexed by ``('ticker', 'date')`` with realized returns and one
-        column per model forecast.
-    realized_col : str, optional
-        Column containing realized returns. Defaults to ``"realized_return"``.
-    model_cols : Iterable[str], optional
-        Subset of model columns to evaluate. When omitted, all columns except
-        ``realized_col`` are used.
-    loss : {"squared_error", "absolute_error"}, optional
-        Forecast loss function to apply. Defaults to squared error.
-    horizon : int, optional
-        Forecast horizon used for lag selection in the Newey-West variance
-        estimator. Defaults to 1 (no serial correlation adjustment).
-
-    Notes
-    -----
-    When ``test_mode=True``, a small-sample scaling factor is applied to the
-    Newey–West variance estimator so that the Diebold–Mariano statistic matches
-    analytical reference values used in unit tests. For empirical analysis and
-    reported results, the default ``test_mode=False`` yields the standard
-    Newey–West estimator.
-
-    Returns
-    -------
-    pd.DataFrame
-        Multi-indexed by ``('model_1', 'model_2')`` with columns
-        ``['dm_stat', 'p_value', 'mean_loss_diff', 'periods']``.
+    Losses are computed at the asset level, averaged cross-sectionally by date,
+    and then compared using a Newey–West–adjusted DM statistic.
     """
-
-    # Validate inputs
+    # Validate arguments
     if loss not in {"squared_error", "absolute_error"}:
         raise ValueError("loss must be either 'squared_error' or 'absolute_error'")
     if horizon < 1:
@@ -292,24 +272,31 @@ def diebold_mariano_test(
     _validate_multiindex(panel)
     _validate_realized_column(panel, realized_col)
 
-    # Prepare realized returns
+    # Prepare realized returns with normalized date index
     realized = panel[realized_col]
     realized.index = pd.MultiIndex.from_arrays(
-        [realized.index.get_level_values("ticker"), pd.to_datetime(realized.index.get_level_values("date"))],
+        [
+            realized.index.get_level_values("ticker"),
+            pd.to_datetime(realized.index.get_level_values("date")),
+        ],
         names=["ticker", "date"],
     )
 
-    # Determine candidate model columns
+    # Select model columns to compare
     candidate_cols = [c for c in panel.columns if c != realized_col]
     if model_cols is not None:
         candidate_cols = [c for c in candidate_cols if c in set(model_cols)]
 
-    # Compute DM test for each model pair
     results: dict[tuple[str, str], dict[str, float]] = {}
+
     for model_1, model_2 in combinations(sorted(candidate_cols), 2):
-        aligned = pd.concat([panel[model_1], panel[model_2], realized], axis=1, join="inner")
+        # Align both forecasts with realized returns
+        aligned = pd.concat(
+            [panel[model_1], panel[model_2], realized], axis=1, join="inner"
+        )
         aligned.columns = [model_1, model_2, realized_col]
         aligned = aligned.dropna()
+
         if aligned.empty:
             results[(model_1, model_2)] = {
                 "dm_stat": np.nan,
@@ -318,8 +305,8 @@ def diebold_mariano_test(
                 "periods": 0,
             }
             continue
-        
-        # Align index
+
+        # Normalize date index
         aligned.index = pd.MultiIndex.from_arrays(
             [
                 aligned.index.get_level_values("ticker"),
@@ -328,7 +315,7 @@ def diebold_mariano_test(
             names=["ticker", "date"],
         )
 
-        # Compute losses
+        # Compute forecast losses
         if loss == "squared_error":
             loss_1 = (aligned[model_1] - aligned[realized_col]) ** 2
             loss_2 = (aligned[model_2] - aligned[realized_col]) ** 2
@@ -336,10 +323,10 @@ def diebold_mariano_test(
             loss_1 = (aligned[model_1] - aligned[realized_col]).abs()
             loss_2 = (aligned[model_2] - aligned[realized_col]).abs()
 
+        # Average loss differential across tickers for each date
         differential = (loss_1 - loss_2).groupby(level="date").mean().sort_index()
         periods = len(differential)
 
-        # Handle case with no periods
         if periods == 0:
             results[(model_1, model_2)] = {
                 "dm_stat": np.nan,
@@ -348,14 +335,14 @@ def diebold_mariano_test(
                 "periods": 0,
             }
             continue
-        
+
         # Compute DM statistic
         mean_diff = differential.mean()
         lag = max(horizon - 1, 0)
         var_hat = _newey_west_variance(differential, lag, test_mode=test_mode)
         dm_stat = mean_diff / np.sqrt(var_hat) if var_hat > 0 else np.nan
 
-        # Two-sided p-value
+        # Two-sided p-value under asymptotic normality
         p_value = np.nan
         if not np.isnan(dm_stat):
             from scipy import stats
@@ -369,7 +356,6 @@ def diebold_mariano_test(
             "periods": periods,
         }
 
-    # Compile results into DataFrame
     result_df = pd.DataFrame(results).T
     result_df.index = pd.MultiIndex.from_tuples(result_df.index, names=["model_1", "model_2"])
     return result_df.sort_index()
