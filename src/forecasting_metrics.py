@@ -25,13 +25,16 @@ RealizedCol = str
 
 def _validate_multiindex(df: pd.DataFrame) -> None:
     """Ensure the DataFrame is indexed by ('ticker', 'date')."""
-    # We rely heavily on grouping by ticker and date, so enforce this strictly
+    # These metrics rely on grouping by ticker/date; enforcing the index contract
+    # prevents subtle bugs where results depend on accidental row ordering or joins.
     if not isinstance(df.index, pd.MultiIndex) or df.index.names[:2] != ["ticker", "date"]:
         raise ValueError("predictions must be indexed by ('ticker', 'date').")
 
 
 def _validate_realized_column(df: pd.DataFrame, realized_col: RealizedCol) -> None:
     """Ensure the realized return column exists."""
+    # A missing realized column would silently turn evaluation into nonsense,
+    # so fail fast with a clear error message.
     if realized_col not in df.columns:
         raise KeyError(f"Missing realized return column '{realized_col}'.")
 
@@ -42,10 +45,12 @@ def _align_predictions(predictions: pd.Series, realized: pd.Series) -> pd.DataFr
     The function performs an inner join on ('ticker', 'date') and drops
     observations with missing values on either side.
     """
-    # Inner join ensures we only keep observations available for both series
+    # We only want to score forecasts where the outcome is actually observed;
+    # inner alignment avoids implicitly “rewarding” models for missing data.
     aligned = pd.concat([predictions, realized], axis=1, join="inner").dropna()
 
-    # Normalize date level to datetime for consistent downstream grouping
+    # Normalizing the date dtype avoids time-based grouping surprises (e.g., strings,
+    # periods, or mixed timezone types producing inconsistent group keys).
     aligned.index = pd.MultiIndex.from_arrays(
         [
             aligned.index.get_level_values("ticker"),
@@ -61,19 +66,23 @@ def compute_oos_r2(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
     true_series = pd.Series(y_true)
     pred_series = pd.Series(y_pred)
 
-    # Guard against empty or incompatible inputs
+    # Defensive checks keep the metric stable in edge cases (e.g., no OOS periods,
+    # mismatched vectors after filtering), returning NaN instead of misleading numbers.
     if true_series.empty or pred_series.empty or len(true_series) != len(pred_series):
         return np.nan
 
-    # Sum of squared prediction errors
+    # R² is defined relative to a baseline; SSE captures how far predictions are
+    # from the realized outcomes on average.
     errors = true_series - pred_series
     sse = (errors**2).sum()
 
-    # Baseline forecast is the unconditional mean
+    # The unconditional mean is a simple, transparent benchmark; using it makes
+    # the interpretation “improvement over a naive constant forecast”.
     baseline = true_series.mean()
     sst = ((true_series - baseline) ** 2).sum()
 
-    # If variance is zero, R² is undefined
+    # If there is no variation in outcomes, there is nothing to explain; returning
+    # NaN avoids spuriously large values from dividing by zero.
     if sst == 0:
         return np.nan
 
@@ -89,14 +98,17 @@ def compute_oos_r2_cs(aligned: pd.DataFrame) -> float:
     if aligned.empty:
         return np.nan
 
-    # First column = predictions, second = realized returns
+    # The alignment convention is important: the metric assumes column 0 is the
+    # forecast and column 1 is the realized value, so we keep it explicit here.
     pred = aligned.iloc[:, 0]
     y = aligned.iloc[:, 1]
 
-    # Model sum of squared errors
+    # SSE measures model error; keeping it global (not averaged by date) matches
+    # the benchmark construction below and yields a clean “overall” R².
     sse = ((y - pred) ** 2).sum()
 
-    # Cross-sectional baseline varies by date
+    # Using the per-date cross-sectional mean isolates “relative” performance:
+    # the model must do better than predicting the average stock that month.
     ybar_t = y.groupby(level="date").transform("mean")
     sst = ((y - ybar_t) ** 2).sum()
 
@@ -114,15 +126,18 @@ def _monthly_spearman_rank_corr(aligned: pd.DataFrame) -> pd.Series:
     results: dict[pd.Timestamp, float] = {}
 
     for date, group in aligned.groupby(level="date"):
-        # Require at least two assets to define a correlation
+        # With fewer than two assets, ranking/correlation is ill-defined; skipping
+        # avoids injecting arbitrary values into time-series averages.
         if len(group) < 2:
             continue
 
-        # Convert values to percentile ranks within the date
+        # Rank correlations focus on ordering rather than scale, which is often the
+        # economically relevant property in cross-sectional portfolio formation.
         pred_ranks = group.iloc[:, 0].rank(pct=True)
         realized_ranks = group.iloc[:, 1].rank(pct=True)
 
-        # Pearson correlation of ranks equals Spearman correlation
+        # Implementing Spearman via Pearson-on-ranks avoids extra dependencies and
+        # keeps behavior consistent across pandas versions.
         results[pd.to_datetime(date)] = pred_ranks.corr(realized_ranks, method="pearson")
 
     return pd.Series(results).sort_index()
@@ -143,11 +158,13 @@ def evaluate_forecasting_accuracy(
 
     It also returns the full time series of Spearman correlations by date.
     """
-    # Basic structural validation
+    # Structural validation up front avoids evaluating on malformed panels that
+    # would produce hard-to-interpret metrics.
     _validate_multiindex(panel)
     _validate_realized_column(panel, realized_col)
 
-    # Extract realized returns and normalize the date index
+    # Converting dates here ensures all downstream “by date” computations use the
+    # same grouping keys, independent of how the panel was constructed upstream.
     realized = panel[realized_col]
     realized.index = pd.MultiIndex.from_arrays(
         [
@@ -157,7 +174,8 @@ def evaluate_forecasting_accuracy(
         names=["ticker", "date"],
     )
 
-    # Identify which columns correspond to model forecasts
+    # Explicitly selecting forecast columns prevents accidentally evaluating
+    # non-forecast metadata columns as if they were model predictions.
     candidate_cols = [c for c in panel.columns if c != realized_col]
     if model_cols is not None:
         candidate_cols = [c for c in candidate_cols if c in set(model_cols)]
@@ -166,7 +184,8 @@ def evaluate_forecasting_accuracy(
     spearman_frames: list[pd.Series] = []
 
     for col in candidate_cols:
-        # Align predictions with realized returns
+        # Aligning forecast/outcome avoids bias from missingness differences:
+        # models should be compared only where both have observable targets.
         aligned = _align_predictions(panel[col], realized)
         if aligned.empty:
             metrics[col] = {
@@ -177,15 +196,18 @@ def evaluate_forecasting_accuracy(
             }
             continue
 
-        # Pointwise forecast errors
+        # Using absolute/squared errors provides scale-sensitive diagnostics,
+        # complementing rank correlation which is scale-invariant.
         errors = aligned.iloc[:, 0] - aligned.iloc[:, 1]
         mae = errors.abs().mean()
         mse = (errors**2).mean()
 
-        # Cross-sectional R²
+        # Cross-sectional R² measures incremental explanatory power over a
+        # per-month mean benchmark, which is a natural finance baseline.
         r2 = compute_oos_r2_cs(aligned)
 
-        # Cross-sectional rank correlations by date
+        # Spearman is often closer to portfolio relevance: “did we sort stocks in
+        # the right direction this month?”, not “did we predict exact magnitudes?”.
         daily_spearman = _monthly_spearman_rank_corr(aligned)
         spearman_mean = daily_spearman.mean()
 
@@ -196,7 +218,8 @@ def evaluate_forecasting_accuracy(
             "spearman_rank_corr": spearman_mean,
         }
 
-        # Keep full time series for optional diagnostics
+        # Keeping the full time series allows diagnostics (stability, regime shifts),
+        # without forcing the caller to recompute per-date correlations.
         if not daily_spearman.empty:
             spearman_frames.append(daily_spearman.rename(col))
 
@@ -225,24 +248,29 @@ def _newey_west_variance(
     if lag < 0:
         raise ValueError("lag must be >= 0")
 
-    # Convert to float and remove the mean
+    # DM tests require the variance of the mean loss differential; centering by the
+    # sample mean isolates the autocovariance structure used by Newey–West.
     d = differences.astype(float)
     u = d - d.mean()
 
-    # Zero-lag autocovariance
+    # The zero-lag term is the baseline; higher-lag terms correct for serial correlation
+    # introduced by overlapping forecast horizons and persistent errors.
     var = float((u @ u) / n)
 
-    # Add weighted autocovariances up to the truncation lag
+    # Truncation at 'lag' trades off bias and variance; the weights taper autocovariances
+    # so distant lags contribute less, improving finite-sample behavior.
     max_lag = min(int(lag), n - 1)
     for k in range(1, max_lag + 1):
         weight = 1.0 - k / (max_lag + 1.0)
         cov = float((u.iloc[k:].to_numpy() @ u.iloc[:-k].to_numpy()) / n)
         var += 2.0 * weight * cov
 
-    # Convert variance of the series into variance of the sample mean
+    # We ultimately need Var(mean(d_t)), not Var(d_t), because DM is a t-statistic on
+    # the mean loss differential.
     var_mean = var / n
 
-    # Optional scaling used only to match unit-test reference values
+    # Unit tests sometimes pin to a specific reference scaling; keeping this isolated
+    # avoids contaminating the “real” statistical implementation.
     if test_mode:
         var_mean = var_mean / 4.0
 
@@ -263,7 +291,8 @@ def diebold_mariano_test(
     Losses are computed at the asset level, averaged cross-sectionally by date,
     and then compared using a Newey–West–adjusted DM statistic.
     """
-    # Validate arguments
+    # Argument validation prevents comparing models under ambiguous loss definitions
+    # or invalid horizons, both of which would invalidate the DM statistic.
     if loss not in {"squared_error", "absolute_error"}:
         raise ValueError("loss must be either 'squared_error' or 'absolute_error'")
     if horizon < 1:
@@ -272,7 +301,8 @@ def diebold_mariano_test(
     _validate_multiindex(panel)
     _validate_realized_column(panel, realized_col)
 
-    # Prepare realized returns with normalized date index
+    # Normalizing the realized-return index ensures per-date aggregation is stable
+    # and comparable across panels built by different pipelines.
     realized = panel[realized_col]
     realized.index = pd.MultiIndex.from_arrays(
         [
@@ -282,7 +312,8 @@ def diebold_mariano_test(
         names=["ticker", "date"],
     )
 
-    # Select model columns to compare
+    # Restricting comparisons to explicit forecast columns avoids “testing” accidental
+    # non-forecast columns (metadata, identifiers) as if they were models.
     candidate_cols = [c for c in panel.columns if c != realized_col]
     if model_cols is not None:
         candidate_cols = [c for c in candidate_cols if c in set(model_cols)]
@@ -290,7 +321,8 @@ def diebold_mariano_test(
     results: dict[tuple[str, str], dict[str, float]] = {}
 
     for model_1, model_2 in combinations(sorted(candidate_cols), 2):
-        # Align both forecasts with realized returns
+        # Using an inner alignment ensures fairness: both models are scored on the same
+        # set of (ticker, date) outcomes so missingness doesn't drive the comparison.
         aligned = pd.concat(
             [panel[model_1], panel[model_2], realized], axis=1, join="inner"
         )
@@ -306,7 +338,8 @@ def diebold_mariano_test(
             }
             continue
 
-        # Normalize date index
+        # Ensuring datetime dates avoids group-key mismatches when computing the
+        # per-month average loss differential.
         aligned.index = pd.MultiIndex.from_arrays(
             [
                 aligned.index.get_level_values("ticker"),
@@ -315,7 +348,8 @@ def diebold_mariano_test(
             names=["ticker", "date"],
         )
 
-        # Compute forecast losses
+        # Loss choice determines what “better” means; squared error emphasizes outliers,
+        # absolute error is more robust to heavy tails common in returns.
         if loss == "squared_error":
             loss_1 = (aligned[model_1] - aligned[realized_col]) ** 2
             loss_2 = (aligned[model_2] - aligned[realized_col]) ** 2
@@ -323,7 +357,8 @@ def diebold_mariano_test(
             loss_1 = (aligned[model_1] - aligned[realized_col]).abs()
             loss_2 = (aligned[model_2] - aligned[realized_col]).abs()
 
-        # Average loss differential across tickers for each date
+        # Averaging across tickers creates one time series observation per date,
+        # which is the object DM tests are designed to compare.
         differential = (loss_1 - loss_2).groupby(level="date").mean().sort_index()
         periods = len(differential)
 
@@ -336,13 +371,15 @@ def diebold_mariano_test(
             }
             continue
 
-        # Compute DM statistic
+        # Newey–West is essential when losses are serially correlated; without it,
+        # DM statistics can be overstated and p-values misleading.
         mean_diff = differential.mean()
         lag = max(horizon - 1, 0)
         var_hat = _newey_west_variance(differential, lag, test_mode=test_mode)
         dm_stat = mean_diff / np.sqrt(var_hat) if var_hat > 0 else np.nan
 
-        # Two-sided p-value under asymptotic normality
+        # Using the asymptotic normal approximation is standard in DM settings;
+        # it yields a comparable scale across model pairs.
         p_value = np.nan
         if not np.isnan(dm_stat):
             from scipy import stats

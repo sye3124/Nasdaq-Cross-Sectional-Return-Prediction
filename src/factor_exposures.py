@@ -51,7 +51,8 @@ class ExposureConfig:
 
     # pylint: disable=missing-function-docstring
     def __post_init__(self) -> None:
-        # Basic sanity checks to avoid silent misconfiguration.
+        # These checks fail fast on impossible window choices, which is much
+        # easier to debug than silently producing empty/unstable exposures.
         if self.min_months <= 0 or self.max_months <= 0:
             raise ValueError("Window lengths must be positive.")
         if self.min_months > self.max_months:
@@ -78,29 +79,36 @@ def _fit_rolling_window(window: pd.DataFrame, config: ExposureConfig) -> Optiona
         Returns ``None`` if there is not enough data (or the regression fails).
     """
 
-    # Keep only rows where all regression inputs are present.
+    # OLS needs a complete design matrix; dropping incomplete rows avoids
+    # estimating betas from mismatched timelines (e.g., missing RF or factors).
     required_cols = [config.return_col, config.rf_col, *config.factor_cols]
     trimmed = window.dropna(subset=required_cols)
 
-    # If we don't have enough observations, skip this window.
+    # Short windows produce very noisy betas; enforcing a minimum history makes
+    # exposures more stable and comparable across tickers.
     if len(trimmed) < config.min_months:
         return None
 
-    # Response: stock excess return over the risk-free rate.
+    # Using excess returns isolates systematic risk premia from the cash rate,
+    # matching the FF factor definitions and preventing RF from “leaking” into alpha.
     excess_returns = trimmed[config.return_col] - trimmed[config.rf_col]
 
-    # Predictors: the factor returns, plus an explicit intercept.
+    # Including an intercept lets the regression separate average abnormal
+    # performance (alpha) from systematic factor-driven variation.
     factors = trimmed[list(config.factor_cols)]
     X = np.column_stack([np.ones(len(factors)), factors.to_numpy()])
 
-    # Solve via least squares. This keeps dependencies minimal and behaves well
-    # even if the design matrix is close to singular.
+    # Numpy least squares is lightweight and robust: it avoids heavier stats
+    # dependencies and is less fragile when factors are nearly collinear in a window.
     try:
         coefs, *_ = np.linalg.lstsq(X, excess_returns.to_numpy(), rcond=None)
     except Exception:
+        # If a window is numerically problematic, it's safer to skip than to
+        # emit unstable coefficients that could contaminate downstream models.
         return None
 
-    # Package coefficients in a consistent, model-friendly naming scheme.
+    # Using consistent names (“beta_<factor>”) makes downstream merges and
+    # model feature selection simpler and less error-prone.
     out = {"alpha_ff3": coefs[0]}
     out.update({f"beta_{name}": coefs[i + 1] for i, name in enumerate(config.factor_cols)})
     return pd.Series(out)
@@ -140,37 +148,46 @@ def compute_factor_exposures(
         ``beta_MKT``, ``beta_SMB``, and ``beta_HML``.
     """
 
-    # Enforce the expected panel shape: (ticker, date) MultiIndex.
+    # The rest of the pipeline relies on consistent (ticker, date) alignment.
+    # Enforcing the index contract here prevents subtle join bugs later.
     if not isinstance(stock_returns.index, pd.MultiIndex) or stock_returns.index.names[:2] != [
         "ticker",
         "date",
     ]:
         raise ValueError("stock_returns must use a MultiIndex with levels ('ticker', 'date').")
 
-    # Standardize factor index naming to make joins predictable.
+    # Ensuring the factor index is explicitly named "date" makes joins predictable
+    # across different factor file sources (French library, WRDS, custom loaders).
     factors = factors.copy()
     if factors.index.name != "date":
         factors.index = pd.Index(factors.index, name="date")
 
     results: list[pd.Series] = []
 
-    # Process each ticker independently (rolling windows are not shared).
+    # Exposures are ticker-specific: we want each stock’s betas to reflect only
+    # its own return history, not pooled cross-sectional information.
     for ticker, df_stock in stock_returns.groupby(level="ticker", sort=True):
         stock = df_stock.droplevel("ticker")
         stock.index = pd.to_datetime(stock.index)
 
-        # Align stock returns with factor data on the date index.
+        # Joining on dates ensures the regression uses factor realizations from the
+        # same period as the stock return, preventing accidental off-by-one errors.
         merged = stock.join(factors, how="left").sort_index()
 
-        # Walk forward in time and fit a trailing regression for each endpoint.
+        # Stepping forward through time mimics the real forecasting setting:
+        # at each date we estimate betas from the trailing history only.
         dates: Iterable[pd.Timestamp] = merged.index
         for idx in range(config.min_months - 1, len(merged)):
-            window_end = idx + 1  # iloc end is exclusive
+            # Using a bounded trailing window keeps exposures responsive to
+            # regime changes while avoiding very long-memory estimates.
+            window_end = idx + 1  # iloc slicing excludes the end index
             window_start = max(0, window_end - config.max_months)
             window = merged.iloc[window_start:window_end]
 
             estimates = _fit_rolling_window(window, config)
             if estimates is None:
+                # Skipping unestimable windows avoids injecting partial/unstable
+                # betas, which can degrade both backtests and ML training.
                 continue
 
             row = estimates.to_dict()
@@ -178,7 +195,8 @@ def compute_factor_exposures(
             row["date"] = dates[idx]
             results.append(row)
 
-    # If nothing was estimable, return an empty frame with the right schema.
+    # Returning an empty, schema-consistent frame makes downstream code simpler:
+    # callers can merge without special-casing "no exposures available".
     if not results:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(
@@ -186,7 +204,8 @@ def compute_factor_exposures(
             index=empty_index,
         )
 
-    # Assemble results and shift within each ticker so exposures at t are known at t.
+    # Lagging by one period enforces information availability: exposures dated t
+    # must be computable using only data up to t-1 (no look-ahead in features).
     df_exposures = pd.DataFrame(results).set_index(["ticker", "date"]).sort_index()
     df_exposures = df_exposures.groupby(level="ticker").shift(1).dropna(how="all")
 

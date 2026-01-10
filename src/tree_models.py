@@ -29,6 +29,8 @@ BoosterType = Literal["xgboost", "lightgbm"]
 
 def _validate_multiindex(panel: pd.DataFrame) -> None:
     """Require a panel indexed by ('ticker', 'date')."""
+    # The entire workflow relies on grouping by date and keeping ticker alignment,
+    # so we fail early if the indexing contract is not satisfied.
     if not isinstance(panel.index, pd.MultiIndex) or panel.index.names[:2] != ["ticker", "date"]:
         raise ValueError("panel must be indexed by ('ticker', 'date').")
 
@@ -53,7 +55,8 @@ class CrossSectionalModelConfig:
     rank_method: str = "average"
 
     def __post_init__(self) -> None:
-        # Keep configuration mistakes obvious.
+        # Restricting to a small set of allowed values prevents silent misconfiguration
+        # (e.g., typos that would otherwise fall through and change behavior).
         if self.prediction_type not in {"prediction", "rank"}:
             raise ValueError("prediction_type must be 'prediction' or 'rank'.")
 
@@ -86,6 +89,8 @@ class GradientBoostingConfig(CrossSectionalModelConfig):
 
 def _build_random_forest(cfg: RandomForestConfig) -> RandomForestRegressor:
     """Instantiate a RandomForestRegressor from a config dataclass."""
+    # Centralizing construction keeps estimator parameters consistent across dates
+    # and makes it easy to audit/reproduce results.
     return RandomForestRegressor(
         n_estimators=cfg.n_estimators,
         max_depth=cfg.max_depth,
@@ -98,7 +103,8 @@ def _build_random_forest(cfg: RandomForestConfig) -> RandomForestRegressor:
 
 def _require_xgboost() -> object:
     """Import XGBoost lazily and fail with a clear message if it's missing."""
-    # We import lazily so the module can be used without xgboost installed.
+    # Lazy imports let the project run on minimal dependencies; users only need
+    # xgboost when they actually request that booster.
     if importlib.util.find_spec("xgboost") is None:
         raise ImportError("xgboost is required to use booster='xgboost'.")
     from xgboost import XGBRegressor  # type: ignore
@@ -108,6 +114,8 @@ def _require_xgboost() -> object:
 
 def _require_lightgbm() -> object:
     """Import LightGBM lazily and fail with a clear message if it's missing."""
+    # Same rationale as XGBoost: keep the base environment lightweight while
+    # providing optional power users a path to stronger learners.
     if importlib.util.find_spec("lightgbm") is None:
         raise ImportError("lightgbm is required to use booster='lightgbm'.")
     from lightgbm import LGBMRegressor  # type: ignore
@@ -119,8 +127,8 @@ def _build_boosting_model(cfg: GradientBoostingConfig):
     """Instantiate either an XGBoost or LightGBM regressor based on cfg.booster."""
     if cfg.booster == "xgboost":
         model_cls = _require_xgboost()
-        # Keep these defaults fairly “finance-safe”: modest depth, subsampling,
-        # and an explicit squared-error regression objective.
+        # Conservative defaults reduce overfitting risk in noisy financial targets:
+        # shallow-ish trees + subsampling typically generalize better cross-sectionally.
         return model_cls(
             n_estimators=cfg.n_estimators,
             max_depth=cfg.max_depth,
@@ -130,12 +138,14 @@ def _build_boosting_model(cfg: GradientBoostingConfig):
             n_jobs=cfg.n_jobs,
             random_state=cfg.random_state,
             objective="reg:squarederror",
-            # Leave regularization knobs explicit so it's obvious they're set.
+            # Making regularization explicit avoids ambiguity about hidden defaults,
+            # and makes later tuning choices easier to interpret.
             reg_lambda=0.0,
             reg_alpha=0.0,
         )
 
     model_cls = _require_lightgbm()
+    # Keep parameter parity across boosters so comparisons are more “apples-to-apples”.
     return model_cls(
         n_estimators=cfg.n_estimators,
         max_depth=cfg.max_depth,
@@ -160,46 +170,55 @@ def _cross_sectional_predictions(
 
     results: list[pd.Series] = []
 
-    # The model is refit independently for each date’s cross-section.
+    # Fitting separately per date isolates the pure cross-sectional mapping for that month,
+    # which is useful for diagnostics and for “instant” baselines without time aggregation.
     for date, df_date in panel.groupby(level="date", sort=True):
-        # Keep rows with features present (we can only score what has features).
+        # We only generate outputs for observations with a complete feature vector;
+        # otherwise, missingness would dominate the model behavior.
         subset = df_date[[*feature_cols, target_col]].dropna(subset=feature_cols)
         if subset.empty:
             continue
 
-        # Training rows also require a non-missing target.
+        # Training requires observed targets; this prevents the model from implicitly
+        # treating missing targets as zeros (or dropping them later in inconsistent ways).
         train_df = subset.dropna(subset=[target_col])
         if train_df.empty:
             continue
 
-        # Fit the estimator on the cross-section.
+        # Each date gets a fresh estimator to avoid accidental state carryover
+        # and to keep the interpretation “one independent model per month”.
         model = estimator_factory()
         train_X = train_df[list(feature_cols)].to_numpy()
         train_y = train_df[target_col].to_numpy()
         model.fit(train_X, train_y)
 
-        # Predict for *all* tickers with available features at this date.
+        # Scoring all tickers with available features makes the output useful for
+        # portfolio construction (where the rank/score is needed even if y is missing).
         pred_df = subset
         X_pred = pred_df[list(feature_cols)].to_numpy()
         preds = model.predict(X_pred)
 
-        # Store as a Series indexed by (ticker, date) so concat is straightforward.
+        # Keeping predictions indexed by (ticker, date) ensures frictionless alignment
+        # with returns, rankings, and decile portfolio routines downstream.
         pred_series = pd.Series(preds, index=pred_df.index, name=cfg.prediction_col)
 
-        # Optionally convert raw predictions to percentile ranks within the date.
+        # Ranking is often more stable than levels for cross-sectional finance tasks,
+        # and makes signals comparable across dates with different return scales.
         if cfg.prediction_type == "rank":
             pred_series = pred_series.groupby(level="date").rank(pct=True, method=cfg.rank_method)
 
         results.append(pred_series)
 
     if not results:
-        # Maintain a predictable empty output shape.
+        # Returning a schema-correct empty frame avoids special-casing later
+        # steps when the input panel is too sparse.
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
 
     output = pd.concat(results).to_frame()
 
-    # Normalize the 'date' level to datetime so downstream joins behave.
+    # Normalizing the date dtype avoids subtle join bugs when upstream code uses
+    # Periods, strings, or mixed timestamp conventions.
     output.index = pd.MultiIndex.from_arrays(
         [
             output.index.get_level_values("ticker"),
@@ -220,7 +239,8 @@ def cross_sectional_random_forest(
     """Fit a random forest per date and return predictions or ranks."""
     cfg = config or RandomForestConfig()
 
-    # We pass a factory lambda so each date gets a fresh estimator instance.
+    # A factory guarantees a brand-new estimator per date, which prevents any
+    # accidental reuse of fitted state across cross-sections.
     return _cross_sectional_predictions(
         panel,
         feature_cols,
@@ -240,6 +260,8 @@ def cross_sectional_gradient_boosting(
     """Fit boosted trees per date (XGBoost or LightGBM) and return predictions or ranks."""
     cfg = config or GradientBoostingConfig()
 
+    # Keeping the orchestration identical to the RF path makes it easier to compare
+    # model families without introducing pipeline differences.
     return _cross_sectional_predictions(
         panel,
         feature_cols,

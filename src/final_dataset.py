@@ -83,7 +83,9 @@ def _standardize_characteristics(
         mean = group.mean()
         std = group.std(ddof=0)
 
-        # Protect against divide-by-zero when a column is constant for a date.
+        # Cross-sections can be tiny or constant in early history (or in a small sample);
+        # replacing zero std with NaN prevents infinite values, and filling with 0.0
+        # ensures downstream models see a neutral value rather than missingness artifacts.
         if hasattr(std, "replace"):  # Series
             std_safe = std.replace(0, np.nan)
         else:  # scalar
@@ -93,7 +95,8 @@ def _standardize_characteristics(
         return scaled.fillna(0.0)
 
     def rank(group):
-        # For Series, rank directly; for DataFrame, rank each column.
+        # Percentile ranks are robust to outliers and heavy tails (common in finance),
+        # and they preserve ordering even when levels are not comparable across months.
         if isinstance(group, pd.Series):
             return group.rank(pct=True, method="average")
         return group.apply(lambda col: col.rank(pct=True, method="average"))
@@ -143,11 +146,13 @@ def assemble_modeling_dataset(
         Rows missing the target or any feature are removed.
     """
 
-    # Guard against typos in the standardization mode.
+    # This check prevents silent fallbacks: a typo like "z_score" would otherwise
+    # run unintended code paths and quietly change model inputs.
     if standardize not in {"zscore", "rank"}:
         raise ValueError("standardize must be 'zscore' or 'rank'.")
 
-    # Verify each input uses the expected panel index.
+    # Failing early on index shape avoids subtle mis-merges (e.g., joins that expand
+    # the panel or align on the wrong level), which can invalidate backtests.
     for df, name in (
         (returns, "returns"),
         (characteristics, "characteristics"),
@@ -155,24 +160,30 @@ def assemble_modeling_dataset(
     ):
         _validate_multiindex(df, name)
 
-    # Align all time stamps to the same month-end convention.
+    # A single timestamp convention is essential for reproducible joins: month-end
+    # labels like 23:59:59.999 vs 00:00:00 represent the same month but won’t match.
     returns = _normalize_month_end_index(returns)
     characteristics = _normalize_month_end_index(characteristics)
     factor_loadings = _normalize_month_end_index(factor_loadings)
 
-    # Target: next-period return per ticker.
+    # Building the target as t+1 ensures we train on information available at t,
+    # matching the forecasting use case and preventing accidental look-ahead.
     next_return = (
         returns[return_col].groupby(level="ticker").shift(-1).to_frame(next_return_col)
     )
 
-    # Only standardize numeric characteristics; keep non-numeric columns out.
+    # Standardization should operate only on numeric signals; excluding non-numeric
+    # columns prevents accidental coercions and keeps features strictly model-ready.
     chars = characteristics.select_dtypes(include=[np.number]).copy()
     standardized_chars = _standardize_characteristics(chars, method=standardize)
 
-    # Join features + exposures + target into one panel.
+    # Concatenation on a shared MultiIndex keeps alignment explicit and avoids
+    # hidden key logic; every column in the final panel shares the same (ticker, date).
     dataset = pd.concat([standardized_chars, factor_loadings, next_return], axis=1)
 
-    # Keep only rows where we have a target and a full feature vector.
+    # Dropping missing targets avoids training on rows that cannot be evaluated.
+    # Dropping remaining NaNs ensures models see complete feature vectors and
+    # prevents implicit imputation differences across model families.
     dataset = dataset.dropna(subset=[next_return_col])
     dataset = dataset.dropna()
 

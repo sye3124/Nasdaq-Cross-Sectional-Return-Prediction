@@ -24,6 +24,8 @@ PredictionType = Literal["prediction", "rank"]
 
 def _validate_multiindex(panel: pd.DataFrame) -> None:
     """Require a (ticker, date) MultiIndex so we can group cleanly by date."""
+    # These models are “one regression per month”; without a strict (ticker, date)
+    # index contract, group-by behavior can silently change and invalidate results.
     if not isinstance(panel.index, pd.MultiIndex) or panel.index.names[:2] != ["ticker", "date"]:
         raise ValueError("panel must be indexed by ('ticker', 'date').")
 
@@ -48,7 +50,8 @@ class CrossSectionalOLSConfig:
     rank_method: str = "average"
 
     def __post_init__(self) -> None:
-        # Catch typos early (e.g. "ranks" vs "rank").
+        # Preventing mis-typed modes keeps experiments reproducible; otherwise a
+        # small spelling mistake could quietly change the output semantics.
         if self.prediction_type not in {"prediction", "rank"}:
             raise ValueError("prediction_type must be 'prediction' or 'rank'.")
 
@@ -68,34 +71,43 @@ def _fit_single_cross_section(
     not required at prediction time). If ``rank=True``, predictions are
     converted to percentile ranks within the cross-section.
     """
-    # Rows usable for fitting need both X and y.
+    # Training requires both predictors and outcomes; restricting to complete rows
+    # avoids implicitly imputing missing values and makes coefficients interpretable.
     fit = df.dropna(subset=[*feature_cols, target_col])
-    # Heuristic: require a little breathing room beyond just "barely identified".
+
+    # Underidentified (or barely identified) regressions produce unstable betas
+    # that can dominate predictions, so we require a small buffer beyond k+1 params.
     if len(fit) < len(feature_cols) + 2:
         return pd.Series(dtype=float)
 
-    # Design matrix: intercept + features.
+    # Adding an intercept prevents forcing the regression through the origin,
+    # which would bias fitted returns if features are not mean-zero in a month.
     X_fit = fit[list(feature_cols)].to_numpy()
     y_fit = fit[target_col].to_numpy()
     X_fit = np.column_stack([np.ones(X_fit.shape[0]), X_fit])
 
-    # Least-squares OLS; lightweight and good enough for a baseline.
+    # Using least squares keeps this baseline lightweight and dependency-free;
+    # we want a simple, transparent benchmark rather than a heavy modeling stack.
     coefs, *_ = np.linalg.lstsq(X_fit, y_fit, rcond=None)
 
-    # Rows usable for prediction only need features.
+    # At “prediction time” we only require features; allowing missing targets here
+    # lets the same function be used even if some tickers lack next_return labels.
     pred_df = df.dropna(subset=[*feature_cols])
     if pred_df.empty:
         return pd.Series(dtype=float)
 
-    # Build prediction matrix with the same intercept convention.
+    # We reuse the exact same intercept convention so train/predict are consistent;
+    # otherwise fitted coefficients would not map correctly to the prediction matrix.
     X_pred = pred_df[list(feature_cols)].to_numpy()
     X_pred = np.column_stack([np.ones(X_pred.shape[0]), X_pred])
     preds = X_pred @ coefs
 
-    # Return as a Series aligned to the original (ticker, date) index.
+    # Returning a Series with the original index preserves (ticker, date) alignment,
+    # which is essential for later merges, ranking, and portfolio construction.
     pred_series = pd.Series(preds, index=pred_df.index)
     if rank:
-        # Ranking is done within the cross-section for this date.
+        # Cross-sectional ranking focuses on ordering (useful for deciles/long-short)
+        # and makes outputs robust to level shifts across months.
         pred_series = pred_series.rank(pct=True, method=rank_method)
 
     return pred_series
@@ -132,15 +144,19 @@ def cross_sectional_ols(
 
     results: list[pd.Series] = []
 
-    # Fit a separate regression for each date's cross-section.
+    # Estimating month-by-month keeps the baseline aligned with the predictive task:
+    # we care about cross-sectional relationships that can vary over time.
     for date, df_date in panel.groupby(level="date", sort=True):
-        # Work on a copy so we can safely subset columns.
+        # Copying avoids chained-assignment and makes it safe to subset aggressively
+        # without mutating the original panel used by other models.
         df_date = df_date.copy()
 
-        # Only keep what the regression needs.
+        # Limiting to necessary columns reduces memory footprint and prevents
+        # accidental leakage from unrelated columns in the panel.
         df_date = df_date[[*feature_cols, target_col]]
 
-        # Fit and predict for this date.
+        # Keeping the estimator and the per-date loop separate makes it easy to
+        # reuse the fitting logic in other cross-sectional baselines.
         pred = _fit_single_cross_section(
             df_date,
             feature_cols=feature_cols,
@@ -149,16 +165,19 @@ def cross_sectional_ols(
             rank_method=cfg.rank_method,
         )
 
-        # Some dates won't have enough usable observations; skip those.
+        # Some months genuinely cannot be estimated (too few stocks or too much missingness);
+        # skipping them avoids manufacturing predictions from unreliable fits.
         if not pred.empty:
             results.append(pred.rename(cfg.prediction_col))
 
-    # If nothing was produced, return an empty frame with the right schema.
+    # Returning an empty-but-well-typed frame keeps downstream merges predictable
+    # and makes “no predictions available” an explicit, non-crashing state.
     if not results:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.prediction_col], index=empty_index)
 
-    # Stack all date-level Series into one output panel.
+    # Concatenating by index preserves the original (ticker, date) identifiers across months,
+    # which is crucial for evaluating forecasts and forming portfolios consistently.
     output = pd.concat(results).to_frame()
     output.index = pd.MultiIndex.from_arrays(
         [
@@ -171,6 +190,6 @@ def cross_sectional_ols(
 
 
 __all__ = [
-    "CrossSectionalOLSConfig", 
-    "cross_sectional_ols"
+    "CrossSectionalOLSConfig",
+    "cross_sectional_ols",
 ]

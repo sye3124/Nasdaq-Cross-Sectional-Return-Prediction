@@ -37,15 +37,18 @@ def _concat_predictions(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     """
     usable = [df for df in frames if not df.empty]
 
-    # Nothing to merge: return a correctly-indexed empty frame.
+    # Keeping the empty-output case explicit avoids downstream code having to
+    # special-case “no predictions” situations (common in short samples).
     if not usable:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(index=empty_index)
 
-    # Outer join across models so a missing model prediction doesn't drop rows.
+    # We want model columns to align on the same (ticker, date) universe without
+    # letting missing forecasts from one model erase forecasts from another.
     combined = pd.concat(usable, axis=1, join="outer")
 
-    # Normalize the index types (especially the date level) for consistency.
+    # Normalizing index dtypes makes joins and group-bys stable across pipelines
+    # (period vs datetime vs string dates can otherwise create “same month, different key” bugs).
     combined.index = pd.MultiIndex.from_arrays(
         [
             combined.index.get_level_values("ticker"),
@@ -96,14 +99,16 @@ def generate_oos_predictions_all_models(
     """
     cfg = window_config or WindowConfig()
 
-    # Give each model a distinct output column.
+    # Distinct column names are critical for fair side-by-side evaluation: they
+    # prevent accidental overwrites and make comparisons explicit in saved outputs.
     ols_cfg = replace(cfg, prediction_col="ols_pred")
     ridge_cfg = replace(cfg, prediction_col="ridge_pred")
     lasso_cfg = replace(cfg, prediction_col="lasso_pred")
     enet_cfg = replace(cfg, prediction_col="elasticnet_pred")
     rf_cfg = replace(cfg, prediction_col="random_forest_pred")
 
-    # Regularized model configs (CV runs inside rolling_regularized_predictions).
+    # Using a shared CV structure across regularized models keeps the comparison
+    # “apples-to-apples”: differences should come from the estimator, not from tuning effort.
     ridge_model_cfg = RegularizedModelConfig(model_type="ridge", cv_folds=3)
     lasso_model_cfg = RegularizedModelConfig(model_type="lasso", cv_folds=3, max_iter=100_000)
     enet_model_cfg = RegularizedModelConfig(
@@ -113,8 +118,8 @@ def generate_oos_predictions_all_models(
         max_iter=100_000,
     )
 
-    # Random forest factory so each training step gets a fresh estimator.
-    # (This avoids state leakage between rolling windows.)
+    # A factory ensures each window gets a fresh estimator, which avoids “memory”
+    # from prior fits accidentally influencing later windows (especially for ensembles).
     rf_factory = lambda: RandomForestRegressor(
         n_estimators=500,
         max_depth=6,
@@ -125,7 +130,8 @@ def generate_oos_predictions_all_models(
         n_jobs=-1,
     )
 
-    # Run each model under the rolling OOS scheme and merge their predictions.
+    # Running every model through the same rolling scheme enforces the key OOS rule:
+    # predictions at date t must be trained only on information strictly before t.
     predictions = _concat_predictions(
         [
             rolling_oos_predictions(
@@ -165,7 +171,8 @@ def generate_oos_predictions_all_models(
         ]
     )
 
-    # Attach realized next-period returns so the result can be evaluated directly.
+    # Including realized outcomes in the same output panel makes evaluation pipelines
+    # simple and less error-prone (no separate merge step where indices can misalign).
     realized = panel[[target_col]].rename(columns={target_col: realized_col})
     realized.index = pd.MultiIndex.from_arrays(
         [
@@ -175,13 +182,17 @@ def generate_oos_predictions_all_models(
         names=["ticker", "date"],
     )
 
+    # Inner join ensures we only evaluate forecasts on dates where the target is observed,
+    # which avoids biasing metrics via missing-outcome periods.
     merged = predictions.join(realized, how="inner")
 
-    # Keep rows where at least one model produced a forecast.
+    # Keeping rows where at least one model produced a forecast avoids discarding
+    # useful partial results while still removing fully empty “no prediction” rows.
     prediction_cols = [col for col in merged.columns if col != realized_col]
     merged = merged.dropna(subset=prediction_cols, how="all").sort_index()
 
-    # Optional persistence for downstream analysis / plotting.
+    # Persisting to disk is optional because notebooks often do exploratory runs;
+    # writing only when requested keeps the function pure and test-friendly.
     if output_path is not None:
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,4 +201,6 @@ def generate_oos_predictions_all_models(
     return merged
 
 
-__all__ = ["generate_oos_predictions_all_models"]
+__all__ = [
+    "generate_oos_predictions_all_models"
+]

@@ -49,7 +49,8 @@ def _format_plot_title(
     if subject:
         title += f" — {subject.strip()}"
 
-    # Collect the parenthetical qualifiers (date range, scale, extra notes).
+    # Keeping qualifiers in a single parenthetical makes titles comparable across plots
+    # and prevents lots of slightly-different ad hoc title formats.
     parts: list[str] = []
     if start_date is not None:
         parts.append(f"from {pd.to_datetime(start_date).date()}")
@@ -72,7 +73,9 @@ def _format_y_label(*, log_scale: bool) -> str:
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy with the index coerced to datetime."""
     out = df.copy()
-    out.index = pd.to_datetime(out.index)  # important for consistent slicing and plotting
+    # Many plotting and slicing operations rely on a true DatetimeIndex; coercing here
+    # prevents subtle bugs when the index is object/string/Period-like.
+    out.index = pd.to_datetime(out.index)
     return out
 
 
@@ -85,13 +88,14 @@ def _ensure_model_decile_multiindex(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(cols, pd.MultiIndex):
         return df
 
-    # If the columns are tuples like ("ridge", 1), ("ridge", 2), ... convert them properly.
+    # Some upstream steps naturally produce an "Index of tuples"; turning it into a real
+    # MultiIndex restores stable sorting/selection semantics across pandas versions.
     if len(cols) > 0 and all(isinstance(c, tuple) and len(c) == 2 for c in cols):
         out = df.copy()
         out.columns = pd.MultiIndex.from_tuples(cols, names=[None, None])
         return out
 
-    # If it doesn't look like (model, decile), leave it alone.
+    # If columns aren’t (model, decile)-like, avoid guessing—callers may pass other layouts.
     return df
 
 
@@ -113,22 +117,26 @@ def _reorder_decile_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     ordered_cols: list[tuple[object, object]] = []
     for m in sorted(models, key=lambda x: str(x)):
-        # All columns for this model
+        # Building an explicit column order avoids relying on pandas’ internal lexsort state,
+        # which can make selection brittle when columns are not perfectly sorted.
         sub = [c for c in df.columns if c[0] == m]
 
-        # Numeric deciles first (1..N)
+        # Putting numeric deciles first guarantees "bottom vs top" logic remains well-defined
+        # even if extra columns (like LS) are present.
         numeric = sorted(
             [c for c in sub if isinstance(c[1], (int, np.integer))],
             key=lambda x: int(x[1]),
         )
 
-        # Then extras such as ("model", "LS")
+        # Appending non-numeric labels last keeps plots/tables predictable and avoids surprises
+        # when callers iterate over deciles 1..N.
         other = [c for c in sub if not isinstance(c[1], (int, np.integer))]
         other = sorted(other, key=lambda x: str(x[1]))
 
         ordered_cols.extend(numeric + other)
 
-    # Return a column-reordered view (keeps data unchanged).
+    # Reindexing columns (instead of sorting in place) gives a deterministic layout that’s
+    # robust to pandas MultiIndex edge cases.
     return df.loc[:, ordered_cols]
 
 
@@ -138,7 +146,7 @@ def _plot_cumulative(cumulative: pd.DataFrame, output_path: Path) -> None:
 
     plt.figure(figsize=(10, 6))
 
-    # Plot each column as its own line (stringifying labels to avoid tuple legend weirdness).
+    # Casting labels to string avoids legend formatting headaches when columns are tuples/MultiIndex.
     for col in cumulative.columns:
         plt.plot(cumulative.index, cumulative[col], label=str(col))
 
@@ -148,7 +156,7 @@ def _plot_cumulative(cumulative: pd.DataFrame, output_path: Path) -> None:
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.5)
 
-    # tight_layout can warn on some backends; don't let it crash the run
+    # Some backends can complain about layout constraints; plotting should never break the pipeline.
     try:
         plt.tight_layout()
     except Exception:
@@ -178,13 +186,18 @@ def _summarize_returns_basic(
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     out = returns.copy()
-    out = _ensure_datetime_index(out).sort_index()  # stable time axis is critical
+    # A clean, monotone time index is required for correct cumprod/drawdown math and
+    # makes plot outputs stable across runs.
+    out = _ensure_datetime_index(out).sort_index()
 
-    # Keep MultiIndex columns in a stable order for downstream access/plotting.
+    # Sorting MultiIndex columns prevents order-sensitive plotting/selection and keeps
+    # output tables consistent when exported.
     if isinstance(out.columns, pd.MultiIndex):
         out = out.sort_index(axis=1)
 
-    rf_per_period = risk_free_rate / periods_per_year  # convert annual rf to per-period rf
+    # Convert an annual rf assumption into per-period units so Sharpe math matches the
+    # frequency of the returns panel.
+    rf_per_period = risk_free_rate / periods_per_year
 
     metrics: dict[object, dict[str, float]] = {}
     cumulative: dict[object, pd.Series] = {}
@@ -196,20 +209,22 @@ def _summarize_returns_basic(
             continue
 
         mean_r = float(s.mean())
-        vol = float(s.std(ddof=1))  # sample std (common in performance reporting)
+        # Using ddof=1 matches common performance reporting conventions (sample volatility).
+        vol = float(s.std(ddof=1))
 
-        # Annualized Sharpe ratio using per-period rf.
+        # Sharpe is only meaningful when there is dispersion; guarding avoids spurious inf/NaN churn.
         sharpe = np.nan
         if vol > 0 and not np.isnan(vol):
             sharpe = ((mean_r - rf_per_period) / vol) * math.sqrt(periods_per_year)
 
-        # Simple t-stat for the mean (IID approximation).
+        # The t-stat is an informal diagnostic for “is mean != 0”; it’s still useful even if
+        # we later clip/drop returns for wealth math.
         t_stat = np.nan
         if vol > 0 and len(s) > 1:
             t_stat = mean_r / (vol / math.sqrt(len(s)))
 
-        # Wealth process is undefined if any return is <= -100%.
-        # We drop such returns for cumprod/drawdown math, but still report mean/vol above.
+        # Wealth recursion breaks at returns <= -100% (would imply negative/zero wealth);
+        # we exclude those points from cumprod/drawdowns so plots don’t explode.
         s_wealth = s.where(s > -0.999).dropna()
         if s_wealth.empty:
             metrics[col] = {
@@ -221,8 +236,10 @@ def _summarize_returns_basic(
             }
             continue
 
-        cum = (1.0 + s_wealth).cumprod()          # growth of $1
-        dd = cum / cum.cummax() - 1.0            # drawdown relative to running peak
+        # The wealth index is the most interpretable object for plotting and drawdown computation.
+        cum = (1.0 + s_wealth).cumprod()
+        # Drawdowns are computed relative to the running peak to capture worst peak-to-trough loss.
+        dd = cum / cum.cummax() - 1.0
 
         metrics[col] = {
             "mean_return": mean_r * periods_per_year,
@@ -250,6 +267,8 @@ def compute_dm_significance_table(
     horizon: int = 1,
 ) -> pd.DataFrame:
     """Convenience wrapper around the Diebold–Mariano test implementation."""
+    # Wrapping the core test keeps the reporting API stable even if the underlying
+    # metric implementation changes or gains extra options later.
     return diebold_mariano_test(
         prediction_panel,
         realized_col=realized_col,
@@ -272,7 +291,8 @@ def compute_sharpe_significance_table(
     results: dict[tuple[object, object], pd.Series] = {}
 
     for m1, m2 in combinations(usable, 2):
-        # Each test returns a Series with Sharpes, the JK stat, and a p-value.
+        # Pairwise comparisons make it easy to build a “league table” without
+        # forcing a single arbitrary benchmark model.
         jk = jobson_korkie_test(
             returns,
             model_1=m1,
@@ -319,10 +339,12 @@ def generate_comparison_report(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Make columns safe for any downstream selection/plotting.
+    # Normalizing column layout up front prevents later plotting/slicing code from
+    # depending on pandas’ sometimes-fragile MultiIndex sorting state.
     decile_returns = _reorder_decile_columns(decile_returns)
 
-    # Basic performance on whatever columns were passed in (deciles and/or LS).
+    # A basic summary is often “good enough” for quick iteration; it also avoids
+    # depending on more complex reporting code paths when debugging pipelines.
     metrics, cumulative, drawdowns = _summarize_returns_basic(
         decile_returns,
         risk_free_rate=risk_free_rate,
@@ -331,18 +353,19 @@ def generate_comparison_report(
 
     cum_plot: Path | None = None
 
-    # Optional: plot all curves (can be crowded).
+    # The “all lines” plot is useful for diagnostics, but can be unreadable; keeping it optional
+    # prevents generating noisy artifacts by default.
     if make_all_cumulative_plot and not cumulative.empty:
         cum_plot = output_path / "cumulative_returns.png"
         _plot_cumulative(cumulative, cum_plot)
 
-    # Optional: plot only long/short lines (usually the plot you actually want).
+    # Long/short is typically the headline strategy; plotting just LS keeps the figure interpretable.
     if make_ls_only_plot:
         ls = pm.compute_long_short_returns(decile_returns)
         if ls is not None and not ls.empty:
             ls = _ensure_datetime_index(ls).sort_index()
 
-            # Guard against returns <= -100% before cumprod/log plots.
+            # Wealth math needs returns > -100%; NaN-ing problematic points is safer than crashing.
             ls = ls.where(ls > -0.999)
 
             cum_ls = (1.0 + ls).cumprod()
@@ -352,13 +375,14 @@ def generate_comparison_report(
 
     dm_table: pd.DataFrame | None = None
     if prediction_panel is not None:
-        # DM compares predictive accuracy model-by-model.
+        # DM tests focus on forecast loss differences (model skill), complementing portfolio metrics
+        # which also embed portfolio formation choices and costs.
         dm_table = compute_dm_significance_table(prediction_panel, realized_col=realized_col)
 
     sharpe_table: pd.DataFrame | None = None
     long_short = pm.compute_long_short_returns(decile_returns)
     if long_short is not None and not long_short.empty:
-        # Sharpe tests are only meaningful on the long/short strategy returns.
+        # Sharpe significance makes most sense for a single tradable series per model, hence LS only.
         sharpe_table = compute_sharpe_significance_table(
             long_short,
             risk_free_rate=risk_free_rate,
@@ -391,9 +415,11 @@ def clip_realized_returns(
     """Clip extreme realized returns to keep diagnostics/plots from blowing up."""
     out = predictions.copy()
     if realized_col in out.columns:
-        # Clip only realized returns; predictions stay untouched.
+        # Clipping realized outcomes stabilizes plots/metrics without “fixing” model forecasts,
+        # so you can still see whether predictions are extreme even if realized tails are clipped.
         out[realized_col] = out[realized_col].clip(lower=lower, upper=upper)
-        out = out.dropna(subset=[realized_col])  # drop rows where realized is missing
+        # Dropping missing realized values avoids accidental “good” performance from NaN-handling.
+        out = out.dropna(subset=[realized_col])
     return out
 
 
@@ -416,14 +442,14 @@ def plot_decile_cumulative_for_model(
 
     df = decile_returns.copy()
 
-    # Convert tuple-like columns into a MultiIndex so sorting/selection is reliable.
+    # Ensuring a proper MultiIndex prevents subtle KeyErrors when selecting (model, decile) columns.
     if not isinstance(df.columns, pd.MultiIndex):
         if len(df.columns) > 0 and all(isinstance(c, tuple) and len(c) == 2 for c in df.columns):
             df.columns = pd.MultiIndex.from_tuples(list(df.columns))
     if isinstance(df.columns, pd.MultiIndex):
         df = df.sort_index(axis=1)
 
-    # Only plot deciles that actually exist for this model.
+    # Plot only deciles that are actually present so missing buckets don't silently turn into empty lines.
     cols = [(model, d) for d in range(1, n_deciles + 1) if (model, d) in df.columns]
     if not cols:
         raise KeyError(
@@ -433,12 +459,12 @@ def plot_decile_cumulative_for_model(
 
     sub = df.loc[:, cols].dropna(how="all")
 
-    # Keep time axis clean and optionally restrict sample.
+    # Standardizing the time index keeps plots and date slicing consistent across inputs/pandas versions.
     sub = _ensure_datetime_index(sub).sort_index()
     if start_date is not None:
         sub = sub.loc[pd.to_datetime(start_date) :]
 
-    # Guard: returns <= -100% break wealth math (and log plots).
+    # Wealth recursion fails at <= -100%; replacing those with NaN preserves everything else cleanly.
     sub = sub.where(sub > clip_floor)
 
     cum = (1.0 + sub).cumprod()
@@ -488,21 +514,23 @@ def plot_long_short_cumulative(
 
     df = decile_returns.copy()
 
-    # Ensure MultiIndex columns for consistent long/short extraction.
+    # Coercing to a true MultiIndex makes long/short extraction predictable even when columns
+    # came from CSV round-trips (which often turn MultiIndex into tuples/strings).
     if not isinstance(df.columns, pd.MultiIndex):
         if len(df.columns) > 0 and all(isinstance(c, tuple) and len(c) == 2 for c in df.columns):
             df.columns = pd.MultiIndex.from_tuples(list(df.columns))
     if isinstance(df.columns, pd.MultiIndex):
         df = df.sort_index(axis=1)
 
-    # Compute long/short return panel (model, "long_short") columns.
+    # Computing LS here keeps the plot function “input-agnostic”: caller just provides deciles.
     ls = pm.compute_long_short_returns(df, bottom_decile=bottom_decile, top_decile=top_decile)
     if ls is None or ls.empty:
         raise ValueError("compute_long_short_returns produced an empty DataFrame")
 
     ls = _ensure_datetime_index(ls).sort_index()
     ls = ls.loc[pd.to_datetime(start_date) :]
-    ls = ls.where(ls > clip_floor)  # guard for wealth math
+    # Protect wealth math from pathological returns while keeping the rest of the sample intact.
+    ls = ls.where(ls > clip_floor)
 
     cum = (1.0 + ls).cumprod()
 
@@ -550,7 +578,8 @@ def transaction_cost_stress_test(
     rows: list[pd.Series] = []
 
     for bps in cost_bps_list:
-        # summarize_portfolio_performance applies turnover-based costs internally
+        # Running the same pipeline across cost levels lets you see whether a model’s edge
+        # survives plausible implementation frictions (turnover-sensitive strategies often don’t).
         metrics, cumulative, drawdowns = summarize_portfolio_performance(
             decile_returns,
             turnover_weights=decile_weights,
@@ -559,11 +588,12 @@ def transaction_cost_stress_test(
             plot_path=None,
         )
 
-        # Restrict to the requested reporting window for plots/tables
+        # Applying the window after summary keeps computations consistent, while still producing
+        # presentation-ready outputs restricted to the desired “modern” sample.
         cumulative_post = cumulative.loc[start_date:].copy()
         drawdowns_post = drawdowns.loc[start_date:].copy()
 
-        # Pull out LS rows (index is typically (model, "LS"))
+        # LS is typically the tradable headline; extracting it per cost level produces a compact table.
         ls_idx = [idx for idx in metrics.index if isinstance(idx, tuple) and str(idx[1]) == "LS"]
         for idx in ls_idx:
             r = metrics.loc[idx].copy()
@@ -573,7 +603,7 @@ def transaction_cost_stress_test(
 
         results[bps] = {"metrics": metrics, "cumulative": cumulative_post, "drawdowns": drawdowns_post}
 
-    # One tidy table (easy to sort/filter/export)
+    # A tidy long table is easier to filter, sort, and export than nested dicts of DataFrames.
     tc_summary = pd.DataFrame(rows).reset_index(drop=True)
     tc_summary = tc_summary[
         ["tc_bps", "portfolio", "mean_return", "volatility", "sharpe_ratio", "t_stat_mean", "max_drawdown"]
@@ -581,6 +611,7 @@ def transaction_cost_stress_test(
 
     plot_path: Path | None = None
     if save_plot:
+        # Naming plots by selected models keeps artifacts readable when comparing only a few strategies.
         suffix = "all_models" if not plot_ls_models else "_vs_".join([str(m) for m in plot_ls_models])
         plot_path = output_dir / f"ls_with_costs_log__{suffix}.png"
 
@@ -589,10 +620,10 @@ def transaction_cost_stress_test(
         for bps in cost_bps_list:
             cum = results[bps]["cumulative"]
 
-            # LS columns look like (model, "LS") when using summarize_portfolio_performance.
+            # Selecting LS columns explicitly avoids reliance on fragile MultiIndex slicing rules.
             ls_cols = [c for c in cum.columns if isinstance(c, tuple) and str(c[1]) == "LS"]
 
-            # Optional filter so the plot doesn't get overcrowded.
+            # Filtering reduces visual clutter—otherwise lines = models × cost levels can explode.
             if plot_ls_models is not None:
                 wanted = set(map(str, plot_ls_models))
                 ls_cols = [c for c in ls_cols if str(c[0]) in wanted]
@@ -638,21 +669,23 @@ def run_plot_suite(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clip realized returns only (predictions untouched) to keep plots stable.
+    # Clipping realized tails keeps evaluation plots stable while preserving the model forecasts
+    # (so you can still diagnose “wild prediction” behavior separately).
     preds_clean = clip_realized_returns(
         predictions, realized_col=realized_col, lower=clip_lower, upper=clip_upper
     )
 
-    # Auto-detect model columns (numeric forecasts) when not provided.
+    # Auto-detecting numeric forecast columns makes the helper easy to call after adding/removing models,
+    # without requiring manual column lists everywhere.
     if model_cols is None:
         model_cols = [c for c in preds_clean.columns if c != realized_col]
         model_cols = [c for c in model_cols if preds_clean[c].dtype.kind in "if"]
 
-    # Choose an example model for the decile plot.
+    # Picking a default model avoids “no plot produced” surprises when the caller forgets to specify one.
     if example_model is None:
         example_model = model_cols[0] if len(model_cols) else None
 
-    # Caller may already pass “clean” decile inputs; we keep them as-is here.
+    # Keeping decile inputs untouched avoids “helpful” sanitization that might hide upstream bugs.
     decile_returns_clean = decile_returns.copy()
     decile_weights_clean = decile_weights.copy()
 
@@ -666,14 +699,14 @@ def run_plot_suite(
             output_path=output_dir / f"cumulative_returns_{example_model}.png",
         )
 
-    # Multi-model LS plot.
+    # A multi-model LS plot is usually the fastest sanity check for whether signals have any edge.
     paths["long_short_plot"] = plot_long_short_cumulative(
         decile_returns_clean,
         start_date=start_date,
         output_path=output_dir / "ls_cumulative_log__all_models.png",
     )
 
-    # Stress test cost assumptions; also produces a plot by default.
+    # Stress-testing costs provides an “implementability check” before investing time in refinements.
     tc_out = transaction_cost_stress_test(
         decile_returns_clean,
         decile_weights_clean,
@@ -684,7 +717,7 @@ def run_plot_suite(
         plot_ls_models=["ols_pred", "ridge_rank"],  # keep plot readable by default
     )
 
-    # Persist the summary table as CSV (handy for quick review / spreadsheets).
+    # Saving a compact CSV summary makes results easy to compare without re-running notebooks.
     tc_summary: pd.DataFrame = tc_out["tc_summary"]
     tc_path = output_dir / "tc_summary.csv"
     tc_summary.to_csv(tc_path, index=False)
@@ -705,6 +738,7 @@ def run_plot_suite(
 def _to_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     """Coerce a DataFrame index to datetime and sort."""
     out = df.copy()
+    # Sorting after coercion ensures downstream alignments don't depend on incidental row order.
     out.index = pd.to_datetime(out.index)
     return out.sort_index()
 
@@ -717,18 +751,20 @@ def _sanitize_decile_returns_for_ls(decile_returns: pd.DataFrame) -> pd.DataFram
     out = decile_returns.copy()
     cols = out.columns
 
-    # Convert Index-of-tuples -> MultiIndex when possible.
+    # Turning tuple-like columns into a proper MultiIndex avoids brittle tuple-string mismatches
+    # that occur after CSV round-trips.
     if not isinstance(cols, pd.MultiIndex):
         if len(cols) > 0 and all(isinstance(c, tuple) and len(c) == 2 for c in cols):
             out.columns = pd.MultiIndex.from_tuples(cols)
         else:
             return out
 
-    # Keep only numeric deciles (drop "LS" so top/bottom deciles are unambiguous).
+    # Dropping LS columns ensures we compute spreads from the true top/bottom deciles, rather than
+    # accidentally mixing “pre-computed” spreads into the decile set.
     keep_cols = [c for c in out.columns if isinstance(c[1], (int, np.integer))]
     out = out.loc[:, keep_cols].copy()
 
-    # Stable sort so top/bottom selection behaves consistently.
+    # Sorting keeps “top” and “bottom” definitions stable across pandas versions and column layouts.
     return out.sort_index(axis=1)
 
 
@@ -737,7 +773,8 @@ def _extract_ls_series(ls_df: pd.DataFrame, model_name: str) -> pd.Series:
     if ls_df.empty:
         return pd.Series(dtype=float)
 
-    # Preferred format: MultiIndex columns (model, "long_short") or (model, "LS")
+    # Supporting both ("model","long_short") and ("model","LS") makes the helper tolerant to
+    # alternative naming conventions across modules/notebooks.
     if isinstance(ls_df.columns, pd.MultiIndex) and ls_df.columns.nlevels >= 2:
         lvl0 = ls_df.columns.get_level_values(0)
         lvl1 = ls_df.columns.get_level_values(1).astype(str)
@@ -747,12 +784,13 @@ def _extract_ls_series(ls_df: pd.DataFrame, model_name: str) -> pd.Series:
         if len(cols) == 0:
             return pd.Series(dtype=float)
 
-        col = cols[0]  # if multiple, just pick the first
+        # Picking the first match keeps behavior deterministic even if multiple aliases exist.
+        col = cols[0]
         s = ls_df[col].copy()
         s.name = str(col)
         return s
 
-    # Fallback if columns are single-level strings.
+    # Fallbacks handle older code paths where LS was stored in flat columns.
     for c in [model_name, f"{model_name}_long_short", f"{model_name}_LS"]:
         if c in ls_df.columns:
             s = ls_df[c].copy()
@@ -780,7 +818,8 @@ def plot_long_short_rank_vs_raw(
     if not isinstance(decile_returns_raw, pd.DataFrame) or not isinstance(decile_returns_rank, pd.DataFrame):
         raise TypeError("decile_returns_raw and decile_returns_rank must both be DataFrames")
 
-    # Helper: convert Index-of-tuples to MultiIndex and sort (prevents KeyErrors).
+    # Local “column normalization” avoids requiring callers to sanitize inputs; it also makes
+    # the plot resilient to how decile returns were loaded/saved.
     def _ensure_mi_sorted(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
         if not isinstance(out.columns, pd.MultiIndex):
@@ -793,7 +832,8 @@ def plot_long_short_rank_vs_raw(
     raw_clean = _ensure_mi_sorted(decile_returns_raw)
     rank_clean = _ensure_mi_sorted(decile_returns_rank)
 
-    # Compute long/short for each set of decile returns.
+    # Computing LS within each dataset ensures the comparison isolates “signal encoding”
+    # (raw vs rank) rather than assuming precomputed LS columns exist.
     ls_raw_df = pm.compute_long_short_returns(raw_clean, bottom_decile=bottom_decile, top_decile=top_decile)
     ls_rank_df = pm.compute_long_short_returns(rank_clean, bottom_decile=bottom_decile, top_decile=top_decile)
 
@@ -802,7 +842,7 @@ def plot_long_short_rank_vs_raw(
     if ls_rank_df is None or ls_rank_df.empty:
         raise ValueError(f"RANK long-short is empty for rank_model={rank_model}")
 
-    # Standardize indices before alignment.
+    # Harmonizing indices avoids “same date, different dtype/timezone” alignment bugs.
     ls_raw_df = _ensure_datetime_index(ls_raw_df).sort_index()
     ls_rank_df = _ensure_datetime_index(ls_rank_df).sort_index()
 
@@ -814,19 +854,26 @@ def plot_long_short_rank_vs_raw(
     if rank_key not in ls_rank_df.columns:
         raise KeyError(f"Could not find RANK column {rank_key} in ls_rank_df.columns")
 
-    # Rename for a clean legend.
+    # Renaming produces a clean legend and makes downstream alignment code less verbose.
     s_raw = ls_raw_df[raw_key].rename("RAW")
     s_rank = ls_rank_df[rank_key].rename("RANK")
 
-    # Restrict to the desired sample window.
+    # Applying the same sample window to both series ensures the comparison is apples-to-apples.
     if start_date is not None:
         start_date = pd.to_datetime(start_date)
         s_raw = s_raw.loc[start_date:]
         s_rank = s_rank.loc[start_date:]
 
-    # Align and guard wealth math.
+    # Aligning before wealth math ensures missing dates don’t produce misleading compounding gaps.
     ls = pd.concat([s_raw, s_rank], axis=1).sort_index()
+    # Excluding <= -100% returns avoids undefined wealth; dropna keeps periods where at least one series exists.
     ls = ls.where(ls > clip_floor).dropna(how="all")
+
+    # Capping LS returns prevents one pathological month from dominating the cumulative plot,
+    # keeping the visualization diagnostic rather than “one spike decides everything”.
+    LS_CAP = 1.0
+    ls = ls.clip(lower=-LS_CAP, upper=LS_CAP)
+
     cum = (1.0 + ls).cumprod()
 
     output_path = Path(output_path)

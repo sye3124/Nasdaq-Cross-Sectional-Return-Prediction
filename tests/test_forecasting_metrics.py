@@ -1,13 +1,13 @@
 """Tests for forecasting_metrics.py.
 
 This suite checks:
-- `compute_oos_r2` matches the standard out-of-sample R² definition that uses
-  the sample mean as the baseline.
-- `evaluate_forecasting_accuracy` returns a sensible summary table and a
-  per-date Spearman rank-correlation DataFrame.
-- Input validation behaves as expected (missing columns, bad index, etc.).
-- `diebold_mariano_test` produces the expected loss differential and DM statistic
-  in a small, fully deterministic example.
+- `compute_oos_r2` matches the standard out-of-sample R² definition using the
+  sample mean as the baseline forecast.
+- `evaluate_forecasting_accuracy` returns a correctly-shaped summary table plus
+  a per-date Spearman rank-correlation time series for each model.
+- Validation fails loudly when required structure is missing (MultiIndex, realized column).
+- `diebold_mariano_test` matches a hand-constructed deterministic example, so we
+  know the loss differential aggregation and DM statistic are wired correctly.
 """
 
 import numpy as np
@@ -23,7 +23,11 @@ from src.forecasting_metrics import (
 
 @pytest.fixture
 def sample_panel():
-    """Small (ticker, date) panel with two model forecasts and realized returns."""
+    """Small (ticker, date) panel with two model forecasts and realized returns.
+
+    We keep the dataset tiny and fully deterministic so tests are transparent and
+    failures are easy to debug (no randomness, no large sample effects).
+    """
     index = pd.MultiIndex.from_product(
         [["AAA", "BBB"], pd.to_datetime(["2020-01-01", "2020-02-01"])],
         names=["ticker", "date"],
@@ -39,12 +43,12 @@ def sample_panel():
 
 
 def test_compute_oos_r2_simple_case():
-    # Simple sanity check against a manual R² computation.
+    # Use a minimal example where we can compute SSE and SST by hand.
     y_true = [1.0, 2.0, 3.0]
     y_pred = [0.8, 2.2, 3.1]
     r2 = compute_oos_r2(y_true, y_pred)
 
-    # R² = 1 - SSE/SST where baseline is mean(y_true).
+    # OOS R² uses the unconditional mean of y_true as the baseline forecast.
     errors = np.array(y_true) - np.array(y_pred)
     sse = np.sum(errors**2)
     baseline = np.mean(y_true)
@@ -55,23 +59,23 @@ def test_compute_oos_r2_simple_case():
 
 
 def test_evaluate_forecasting_accuracy_summary(sample_panel):
-    # Evaluate both models and request "realized" as the outcome column.
+    # Run the full evaluation to ensure we get both the scalar summary and the time series output.
     summary, spearman = evaluate_forecasting_accuracy(sample_panel, realized_col="realized")
 
-    # Summary table should have one row per model and the expected columns.
+    # The summary should contain one row per model column and a stable metric schema.
     assert set(summary.index) == {"model_a", "model_b"}
     assert set(summary.columns) == {"oos_r2", "mae", "mse", "spearman_rank_corr"}
 
     # ---- Manual metric reconstruction for model_a ----
-    # (Aligned is already clean in this synthetic test, but we follow the same logic.)
+    # We reconstruct the same ingredients so this test detects logic regressions (not just shape issues).
     aligned_a = sample_panel[["model_a", "realized"]]
 
-    # Errors are prediction minus realized.
+    # MAE/MSE are computed on pooled asset-level errors.
     errors_a = aligned_a["model_a"] - aligned_a["realized"]
     expected_mae_a = errors_a.abs().mean()
     expected_mse_a = (errors_a**2).mean()
 
-    # Cross-sectional OOS R² baseline uses the per-date mean realized return.
+    # Cross-sectional OOS R² uses a per-date mean realized return as the baseline.
     sse_a = ((aligned_a["realized"] - aligned_a["model_a"]) ** 2).sum()
     ybar_t = aligned_a["realized"].groupby(level="date").transform("mean")
     sst_a = ((aligned_a["realized"] - ybar_t) ** 2).sum()
@@ -81,10 +85,10 @@ def test_evaluate_forecasting_accuracy_summary(sample_panel):
     assert np.isclose(summary.loc["model_a", "mse"], expected_mse_a)
     assert np.isclose(summary.loc["model_a", "oos_r2"], expected_r2_a)
 
-    # ---- Spearman rank correlation (per date), then average across dates ----
+    # ---- Spearman rank correlation: compute within each cross-section, then average over dates ----
     daily_corrs = []
     for _, group in aligned_a.groupby(level="date"):
-        # Spearman can be computed by correlating percentile ranks.
+        # Spearman can be implemented as Pearson correlation of within-date ranks.
         pred_ranks = group["model_a"].rank(pct=True)
         realized_ranks = group["realized"].rank(pct=True)
         daily_corrs.append(pred_ranks.corr(realized_ranks))
@@ -92,14 +96,14 @@ def test_evaluate_forecasting_accuracy_summary(sample_panel):
 
     assert np.isclose(summary.loc["model_a", "spearman_rank_corr"], expected_spearman)
 
-    # ---- Per-date Spearman output shape ----
-    # We should get a DataFrame indexed by date with one column per model.
+    # ---- Per-date Spearman output contract ----
+    # The time series is useful for diagnostics, so we assert its index/columns are predictable.
     assert spearman.index.is_monotonic_increasing
     assert list(spearman.columns) == sorted(summary.index)
 
 
 def test_evaluate_forecasting_accuracy_subset_models(sample_panel):
-    # Restrict the evaluation to a subset of model columns.
+    # Allow callers to evaluate a subset without accidentally leaking in extra columns.
     summary, spearman = evaluate_forecasting_accuracy(
         sample_panel, realized_col="realized", model_cols=["model_b"]
     )
@@ -109,35 +113,35 @@ def test_evaluate_forecasting_accuracy_subset_models(sample_panel):
 
 
 def test_evaluate_forecasting_accuracy_missing_realized(sample_panel):
-    # Missing the realized column should raise a KeyError.
+    # The realized outcome column is required; missing it should fail clearly.
     with pytest.raises(KeyError):
         evaluate_forecasting_accuracy(sample_panel.drop(columns=["realized"]))
 
 
 def test_evaluate_forecasting_accuracy_invalid_index(sample_panel):
-    # The API requires a ('ticker', 'date') MultiIndex.
+    # The implementation relies on grouping by ticker/date, so it must reject non-MultiIndex inputs.
     bad_index_df = sample_panel.reset_index()
     with pytest.raises(ValueError):
         evaluate_forecasting_accuracy(bad_index_df, realized_col="realized")
 
 
 def test_diebold_mariano_test(sample_panel):
-    # DM test compares per-date mean forecast losses between model pairs.
+    # DM test compares average forecast losses across time, so we validate it on a tiny deterministic panel.
     results = diebold_mariano_test(sample_panel, realized_col="realized")
 
-    # Output index should identify the model pair.
+    # The output index identifies which two models are being compared in each row.
     assert list(results.index.names) == ["model_1", "model_2"]
     assert ("model_a", "model_b") in results.index
 
-    # ---- Manual DM inputs for the same panel ----
-    # Default loss is squared error.
+    # ---- Manual DM construction for the same panel ----
+    # Use squared error (the default loss) so the calculation is fully deterministic.
     se_a = (sample_panel["model_a"] - sample_panel["realized"]) ** 2
     se_b = (sample_panel["model_b"] - sample_panel["realized"]) ** 2
 
-    # Loss differential is averaged across tickers within each date.
+    # DM works on one observation per date: the cross-sectional mean loss differential.
     diff_by_date = (se_a - se_b).groupby(level="date").mean().sort_index()
 
-    # For horizon=1, Newey-West lag = 0, so var(mean) is just gamma0 / n.
+    # With horizon=1, the Newey–West lag is 0, so var(mean) reduces to gamma0 / n.
     mean_diff = diff_by_date.mean()
     demeaned = diff_by_date - mean_diff
     gamma0 = (demeaned @ demeaned) / len(diff_by_date)

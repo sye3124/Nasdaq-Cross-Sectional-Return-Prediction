@@ -78,7 +78,13 @@ def test_random_forest_rank_output():
     panel = _make_panel()
 
     # Rank mode returns percentile ranks within each cross-section (date).
-    cfg = RandomForestConfig(prediction_type="rank", prediction_col="rank", n_estimators=1, bootstrap=False)
+    cfg = RandomForestConfig(
+        prediction_type="rank",
+        prediction_col="rank",
+        n_estimators=1,
+        bootstrap=False,
+        random_state=0,
+    )
     ranks = cross_sectional_random_forest(panel, ["x1", "x2"], config=cfg)
 
     # If the forest predicts exactly, ranking predictions equals ranking the true target.
@@ -106,5 +112,5 @@ def test_gradient_boosting_predictions_track_target():
     preds = cross_sectional_gradient_boosting(panel, ["x1", "x2"], config=cfg)
 
     # We don't require exact equality here, just that the fit is very tight.
-    mae = np.mean(np.abs(preds[cfg.prediction_col].values - panel["next_return"].values))
+    mae = float(np.mean(np.abs(preds[cfg.prediction_col].values - panel["next_return"].values)))
     assert mae < 1e-3

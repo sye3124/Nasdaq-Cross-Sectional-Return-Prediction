@@ -1,10 +1,28 @@
 """Tests for portfolios.py.
 
-These tests cover `compute_decile_portfolio_returns`, which:
-- assigns within-date deciles based on a model signal
-- computes equal-weighted or value-weighted returns per (date, decile)
-- reshapes results into a DataFrame with MultiIndex columns (model, decile)
-- optionally adds a long-short spread column ("LS") when both extreme deciles exist
+This test module validates `compute_decile_portfolio_returns`, which takes a
+(ticker, date) panel containing model signals and realized returns, then builds
+decile-sorted portfolio return series.
+
+What is tested
+--------------
+- Decile assignment:
+    Assigns tickers to within-date deciles using quantile binning when possible,
+    and falls back to rank-based binning when the cross-section has too few
+    unique values (common with small samples or tied signals).
+
+- Return aggregation:
+    Computes portfolio returns per (date, decile) using either:
+      * equal weights (simple mean), or
+      * value weights (sum(w * r) / sum(w)) when `weight_col` is provided.
+
+- Output layout:
+    Returns a DataFrame indexed by date with MultiIndex columns (model, decile),
+    where decile is typically 1..N plus an optional "LS" column.
+
+- Long–short spread:
+    Adds an "LS" column per model equal to top minus bottom only when both
+    extreme deciles (1 and N) exist for that model/date; otherwise the spread is NaN.
 """
 
 import numpy as np

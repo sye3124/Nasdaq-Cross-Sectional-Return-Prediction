@@ -50,11 +50,8 @@ def _build_panel() -> pd.DataFrame:
             next_return = 1.0 + 2 * x1 - x2
             records.append((ticker, date, x1, x2, next_return))
 
-    # Store as a MultiIndex panel keyed by (ticker, date).
-    idx = pd.MultiIndex.from_tuples([(t, d) for t, d, *_ in records], names=["ticker", "date"])
-    df = pd.DataFrame(records, columns=["ticker", "date", "x1", "x2", "next_return"]).set_index(idx)
-
-    return df
+    df = pd.DataFrame(records, columns=["ticker", "date", "x1", "x2", "next_return"])
+    return df.set_index(["ticker", "date"]).sort_index()
 
 
 @pytest.mark.parametrize("model_type", ["ridge", "lasso", "elasticnet"])
@@ -81,7 +78,7 @@ def test_regularized_models_track_linear_relation(model_type):
     )
 
     # With min_train_months=2, the first prediction occurs at the 3rd distinct month.
-    expected_dates = panel.index.get_level_values("date").unique()[2:]
+    expected_dates = panel.index.get_level_values("date").unique().sort_values()[2:]
     assert list(preds.index.get_level_values("date").unique()) == list(expected_dates)
 
     # Compare predictions to the true target for the same (ticker, date) rows.

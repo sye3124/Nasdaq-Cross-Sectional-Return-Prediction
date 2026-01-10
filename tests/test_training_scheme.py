@@ -45,11 +45,12 @@ def _build_panel(values_by_date: dict[pd.Timestamp, dict[str, float]]) -> pd.Dat
     and the target column.
     """
     entries = []
-    for date, val in values_by_date.items():
-        entries.append((("AAA", date), val))
+    # Sort for determinism (dict insertion order is usually stable, but tests should not rely on it)
+    for date in sorted(values_by_date.keys()):
+        entries.append((("AAA", date), values_by_date[date]))
 
     index, vals = zip(*entries)
-    return pd.DataFrame(vals, index=pd.MultiIndex.from_tuples(index, names=["ticker", "date"]))
+    return pd.DataFrame(vals, index=pd.MultiIndex.from_tuples(index, names=["ticker", "date"])).sort_index()
 
 
 class _DummyLinearModel:
@@ -71,19 +72,21 @@ class _DummyLinearModel:
 def test_rolling_predictions_respect_min_and_max_window():
     # Build 6 monthly observations for one ticker where y = 2x exactly.
     dates = pd.date_range("2020-01-31", periods=6, freq="ME")
-    panel = _build_panel({dates[i]: {"feature": i + 1, "next_return": 2 * (i + 1)} for i in range(len(dates))})
+    panel = _build_panel(
+        {dates[i]: {"feature": i + 1, "next_return": 2 * (i + 1)} for i in range(len(dates))}
+    )
 
     # Predictions start only after we have min_train_months months of history.
     # With min_train_months=3, the first OOS prediction happens at dates[3].
     cfg = WindowConfig(min_train_months=3, max_train_months=4, prediction_col="pred")
     preds = rolling_oos_predictions(panel, ["feature"], window_config=cfg)
 
-    expected_dates = dates[3:]
+    expected_dates = dates[cfg.min_train_months :]
     assert list(preds.index.get_level_values("date")) == list(expected_dates)
 
     # With no model_factory provided, rolling_oos_predictions falls back to OLS.
     # The OLS should recover y = 2x perfectly and emit one prediction per OOS month.
-    expected_values = 2 * (np.arange(4, 7))  # features at dates[3:] are 4, 5, 6
+    expected_values = 2 * np.array([4, 5, 6], dtype=float)  # features at dates[3:] are 4, 5, 6
     np.testing.assert_allclose(preds["pred"].values, expected_values)
 
 
@@ -101,7 +104,8 @@ def test_expanding_window_grows_history():
     )
 
     # Expanding=True means we always start training at the beginning of the sample.
-    cfg = WindowConfig(min_train_months=2, max_train_months=2, expanding=True)
+    # (max_train_months is ignored in the implementation for expanding windows.)
+    cfg = WindowConfig(min_train_months=2, max_train_months=2, expanding=True, prediction_col="prediction")
     preds = rolling_oos_predictions(panel, ["feature"], window_config=cfg)
 
     # For the last month, the training set includes all prior months (3 points).
@@ -121,7 +125,7 @@ def test_time_series_tuning_selects_best_candidate_and_tracks_models():
             feature = i + offset
             records.append({"ticker": ticker, "date": date, "feature": feature, "next_return": 2 * feature})
 
-    panel = pd.DataFrame.from_records(records).set_index(["ticker", "date"])
+    panel = pd.DataFrame.from_records(records).set_index(["ticker", "date"]).sort_index()
 
     candidates = [
         CandidateModel("underfit", lambda: _DummyLinearModel(1.0)),

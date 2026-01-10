@@ -57,7 +57,8 @@ class RankingConfig:
     rank_method: str = "average"
 
     def __post_init__(self) -> None:
-        # Validate the small set of allowed options to prevent silent misconfig.
+        # Restricting to a small option set keeps runs reproducible and prevents
+        # subtle “typo-driven” behavior changes in portfolio construction.
         if self.basis not in {"return", "zscore"}:
             raise ValueError("basis must be 'return' or 'zscore'.")
         if self.risk_adjust not in {"volatility", "beta", None}:
@@ -70,6 +71,8 @@ class RankingConfig:
 
 def _validate_multiindex(df: pd.DataFrame) -> None:
     """Require predictions to be indexed by ('ticker', 'date')."""
+    # Ranking is defined cross-sectionally “within each date”; without a strict
+    # (ticker, date) index contract, groupby semantics can silently break.
     if not isinstance(df.index, pd.MultiIndex) or df.index.names[:2] != ["ticker", "date"]:
         raise ValueError("predictions must be indexed by ('ticker', 'date').")
 
@@ -82,8 +85,14 @@ def _cross_sectional_zscore(series: pd.Series) -> pd.Series:
     """
     grouped = series.groupby(level="date")
     mean = grouped.transform("mean")
+
+    # Z-scoring makes signals comparable across time even if the level/scale drifts,
+    # but the transform must be robust when a month has no dispersion.
     std = grouped.transform(lambda x: x.std(ddof=0)).replace(0, np.nan)
     z = (series - mean) / std
+
+    # Filling degenerate months with 0 preserves a well-defined ordering pipeline
+    # (ranking still works and doesn’t explode due to NaNs).
     return z.fillna(0.0)
 
 
@@ -109,13 +118,15 @@ def convert_predictions_to_rankings(
     if cfg.prediction_col not in predictions.columns:
         raise KeyError(f"Missing prediction column '{cfg.prediction_col}'.")
 
-    # Start from the prediction series and keep only observed values.
+    # Ranking should only reflect observed forecasts; treating missing forecasts as
+    # zeros would distort decile membership and create artificial turnover.
     pred_series = predictions[cfg.prediction_col].dropna()
     if pred_series.empty:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(columns=[cfg.output_col], index=empty_index)
 
-    # Decide which column (if any) we use for risk adjustment.
+    # Keeping the “risk adjustment selection” explicit makes it easy to audit how
+    # rankings were produced (important when comparing strategies).
     if cfg.risk_adjust == "volatility":
         adjust_col = cfg.volatility_col
     elif cfg.risk_adjust == "beta":
@@ -124,7 +135,8 @@ def convert_predictions_to_rankings(
         adjust_col = None
 
     if adjust_col is not None:
-        # Only align on tickers/dates where we have both prediction and risk proxy.
+        # Risk-adjustment is only meaningful where the proxy exists; aligning on the
+        # intersection avoids silently dividing by missing or mismatched values.
         if adjust_col not in predictions.columns:
             raise KeyError(f"Missing risk adjustment column '{adjust_col}'.")
 
@@ -135,7 +147,8 @@ def convert_predictions_to_rankings(
             empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
             return pd.DataFrame(columns=[cfg.output_col], index=empty_index)
 
-        # Avoid division by zero and discard infinities.
+        # Dividing by near-zero/zero risk measures can create infinities that dominate
+        # rankings; replacing zeros and dropping infinities keeps the output stable.
         den = combined[adjust_col].replace(0, np.nan)
         pred_series = (combined[cfg.prediction_col] / den).replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -143,10 +156,12 @@ def convert_predictions_to_rankings(
             empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
             return pd.DataFrame(columns=[cfg.output_col], index=empty_index)
 
-    # Choose the scoring series that will actually be ranked.
+    # The “scoring series” is what drives portfolio assignment; choosing between raw
+    # returns and z-scored values lets you trade off interpretability vs robustness.
     scoring_series = _cross_sectional_zscore(pred_series) if cfg.basis == "zscore" else pred_series
 
-    # Percentile ranks within each date (ties handled via cfg.rank_method).
+    # Percentile ranks are scale-free and map naturally to decile portfolios; using
+    # pct=True also makes the output comparable even if cross-sectional size varies.
     ranks = scoring_series.groupby(level="date").rank(pct=True, method=cfg.rank_method)
 
     output = ranks.rename(cfg.output_col).to_frame()
@@ -161,6 +176,6 @@ def convert_predictions_to_rankings(
 
 
 __all__ = [
-    "RankingConfig", 
-    "convert_predictions_to_rankings"
+    "RankingConfig",
+    "convert_predictions_to_rankings",
 ]

@@ -95,7 +95,8 @@ def compute_long_short_returns(
     if decile_returns.empty:
         return pd.DataFrame()
 
-    # Make sure columns are truly a 2-level MultiIndex; accept list-of-tuples too.
+    # Being permissive about input column formats helps interoperability with
+    # notebook experiments and CSV reloads, while still enforcing a clear schema.
     cols = decile_returns.columns
     if not isinstance(cols, pd.MultiIndex):
         if len(cols) > 0 and all(isinstance(c, tuple) and len(c) == 2 for c in cols):
@@ -110,12 +111,16 @@ def compute_long_short_returns(
     decile_level = decile_returns.columns.get_level_values(1)
 
     for model in pd.unique(model_level):
+        # Long/short spreads are defined on numeric deciles only; skipping non-numeric
+        # tags avoids ambiguous behavior when extra portfolio columns are present.
         numeric_deciles = sorted(
             {d for d in decile_level[model_level == model] if isinstance(d, (int, np.integer))}
         )
         if not numeric_deciles:
             continue
 
+        # Falling back to the available endpoints makes the function robust to cases
+        # where deciles are not 1..10 (e.g., quintiles, tertiles, or partial outputs).
         bot = bottom_decile if bottom_decile in numeric_deciles else numeric_deciles[0]
         top = (
             top_decile
@@ -130,6 +135,8 @@ def compute_long_short_returns(
 
         spread = decile_returns[col_top] - decile_returns[col_bot]
 
+        # Optional clipping is a visualization/stability tool: it limits the influence
+        # of extreme outliers on plots and summary stats in small samples.
         if cap is not None:
             spread = spread.clip(lower=-cap, upper=cap)
 
@@ -164,10 +171,17 @@ def compute_turnover_from_weights(weights: pd.DataFrame) -> pd.DataFrame:
     turnovers: dict[object, pd.Series] = {}
 
     for col in normalized.columns:
+        # Pivoting to date×ticker makes “rebalance from t-1 to t” a simple diff,
+        # and filling missing weights with zero corresponds to “not held”.
         pivot = normalized[col].unstack("ticker").fillna(0.0).sort_index()
         abs_change = pivot.diff().abs()
+
+        # The 0.5 factor converts round-trip gross trading into one-way turnover,
+        # matching common finance definitions and cost models.
         per_period = abs_change.sum(axis=1) * 0.5
 
+        # There is no previous portfolio at the first date, so turnover is undefined;
+        # marking it NaN prevents it from biasing averages downward.
         if len(per_period) > 0:
             per_period.iloc[0] = np.nan
 
@@ -230,10 +244,14 @@ def summarize_portfolio_performance(
         turnover_summary = turnover.mean()
 
         if transaction_cost_bps is not None and transaction_cost_bps != 0:
+            # Expressing costs in decimal return units keeps cost arithmetic consistent
+            # with the return series and avoids unit mistakes (bps vs percent vs decimal).
             cost_per_trade = transaction_cost_bps / 10_000
             turnover_cost = turnover.reindex(returns.index).fillna(0.0)
 
             if isinstance(returns.columns, pd.MultiIndex) and isinstance(turnover_cost.columns, pd.MultiIndex):
+                # Applying costs only where columns align prevents mis-charging the wrong
+                # portfolio and keeps cost adjustments interpretable per model/decile.
                 direct_cols = returns.columns.intersection(turnover_cost.columns)
                 cost_df = (
                     turnover_cost[direct_cols].copy()
@@ -244,6 +262,8 @@ def summarize_portfolio_performance(
             else:
                 overlapping = returns.columns.intersection(turnover_cost.columns)
                 if overlapping.empty:
+                    # If nothing overlaps, it likely indicates a schema mismatch (different
+                    # column labeling conventions), which should be fixed rather than guessed.
                     raise ValueError(
                         "No overlapping columns between returns and turnover_cost. "
                         f"returns cols example: {list(returns.columns)[:5]} | "
@@ -252,6 +272,8 @@ def summarize_portfolio_performance(
                 cost_df = turnover_cost.reindex(columns=overlapping).fillna(0.0)
                 cost_df = cost_df.reindex(columns=returns.columns).fillna(0.0)
 
+            # Subtracting bps×turnover costs turns gross returns into a simple net-of-costs
+            # approximation, which is often enough for sensitivity analysis.
             returns = returns - cost_df * cost_per_trade
 
     if isinstance(returns.columns, pd.MultiIndex):
@@ -269,6 +291,8 @@ def summarize_portfolio_performance(
                 if isinstance(long_short.columns, pd.MultiIndex):
                     long_short = long_short.sort_index(axis=1)
 
+                # Adding LS portfolios in the same return table keeps reporting uniform:
+                # every model can be summarized with the same code paths and plots.
                 returns = pd.concat([returns, long_short], axis=1)
                 returns = returns.sort_index(axis=1)
 
@@ -285,6 +309,8 @@ def summarize_portfolio_performance(
 
                     if isinstance(turnover_cost.columns, pd.MultiIndex):
                         for (model, tag) in long_short.columns:
+                            # When LS weights are not explicitly available, approximating LS turnover
+                            # via top+bottom turnover provides a transparent and conservative proxy.
                             model_deciles = [
                                 d
                                 for (m, d) in turnover_cost.columns
@@ -307,6 +333,8 @@ def summarize_portfolio_performance(
     rf_per_period = risk_free_rate / periods_per_year
 
     PLOT_RET_CLIP = (-0.9, 2.0)
+    # Extremely negative returns can break cumprod (<= -100%) and huge outliers can
+    # dominate plots; clipping is a pragmatic guardrail for reporting.
     returns = returns.clip(lower=PLOT_RET_CLIP[0], upper=PLOT_RET_CLIP[1])
 
     for col in returns.columns:
@@ -319,17 +347,23 @@ def summarize_portfolio_performance(
 
         sharpe = np.nan
         if volatility and not np.isnan(volatility):
+            # Annualizing keeps Sharpe ratios comparable across different sampling frequencies.
             sharpe = ((mean_return - rf_per_period) / volatility) * math.sqrt(periods_per_year)
 
         t_stat = np.nan
         if volatility and len(series) > 1:
+            # A simple t-stat helps diagnose whether average returns are distinguishable from zero.
             t_stat = mean_return / (volatility / math.sqrt(len(series)))
 
+        # Returns below -100% imply bankruptcy in a simple compounded model; removing them
+        # prevents cumulative performance from becoming undefined.
         series = series.where(series > -0.999, np.nan).dropna()
         if series.empty:
             continue
 
         cum = (1.0 + series).cumprod()
+        # Drawdown is defined relative to the running peak; this captures path risk that
+        # Sharpe/vol do not reflect.
         dd = cum / cum.cummax() - 1.0
 
         cumulative[col] = cum
@@ -374,6 +408,8 @@ def _plot_cumulative_returns(cumulative: pd.DataFrame, output_path: str | Path) 
     plt.figure(figsize=(10, 6))
 
     for i, col_label in enumerate(list(cumulative.columns)):
+        # Iterating by position avoids fragile label-based selection when columns are
+        # MultiIndex tuples or contain mixed types.
         series = cumulative.iloc[:, i]
         plt.plot(cumulative.index, series, label=_format_column_label(col_label))
 
@@ -391,6 +427,8 @@ def _compute_sharpe_ratio(
     returns: pd.Series, *, risk_free_rate: float = 0.0, periods_per_year: int = 12
 ) -> float:
     """Compute the annualized Sharpe ratio of a return series."""
+    # Sharpe is defined on excess returns; subtracting per-period RF matches the
+    # sampling frequency of the return series.
     excess = returns.dropna() - risk_free_rate / periods_per_year
     volatility = excess.std(ddof=1)
     if volatility == 0 or np.isnan(volatility):
@@ -403,6 +441,8 @@ def _align_model_returns(returns: pd.DataFrame, model_1: object, model_2: object
     if model_1 not in returns.columns or model_2 not in returns.columns:
         raise KeyError("Both model columns must be present in the returns DataFrame")
 
+    # Pairwise alignment ensures both Sharpe ratios are computed on the same time window,
+    # which is essential for a fair difference test.
     aligned = returns[[model_1, model_2]].dropna()
     aligned.index = pd.to_datetime(aligned.index)
     return aligned.sort_index()
@@ -447,8 +487,11 @@ def jobson_korkie_test(
 
     variance = np.nan
     if not np.isnan(rho):
+        # The variance expression accounts for correlation between strategies; ignoring
+        # rho would overstate evidence when two models’ returns move together.
         variance = ((2 * (1 - rho) * sr1 * sr2) + 0.5 * (sr1**2 + sr2**2)) / n
         if memmel_correction and n > 1:
+            # Memmel correction improves finite-sample behavior of the JK statistic.
             variance -= ((sr1 - sr2) ** 2) / (2 * (n - 1))
 
     jk_stat = (sr1 - sr2) / math.sqrt(variance) if variance and variance > 0 else np.nan
@@ -505,6 +548,8 @@ def bootstrap_sharpe_ratio_difference(
     boot_diffs = np.empty(n_bootstrap)
 
     for i in range(n_bootstrap):
+        # Resampling dates mimics uncertainty in the realized return path; it’s a
+        # simple way to get a sampling distribution without strong parametric assumptions.
         sample_idx = rng.integers(0, n, size=n)
         sampled = aligned.iloc[sample_idx]
 
@@ -516,6 +561,7 @@ def bootstrap_sharpe_ratio_difference(
         )
         boot_diffs[i] = boot_sr1 - boot_sr2
 
+    # A two-sided p-value answers “is the observed difference unusually large in either direction?”
     greater = np.mean(boot_diffs >= observed_diff)
     lower = np.mean(boot_diffs <= observed_diff)
     p_value = 2 * min(greater, lower)

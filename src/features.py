@@ -49,7 +49,8 @@ class FeatureConfig:
     investment_min_months: int = 6
 
     def __post_init__(self) -> None:
-        # Keep config mistakes loud and early.
+        # Fail fast on invalid choices so we don't run long computations
+        # only to discover silently wrong feature definitions later.
         if self.value_method not in {"moving_average", "long_term_reversal"}:
             raise ValueError("value_method must be 'moving_average' or 'long_term_reversal'.")
         if self.profitability_method not in {"rolling_sharpe", "return_over_volatility"}:
@@ -81,12 +82,14 @@ def _compute_dollar_volume(price: pd.Series, volume: pd.Series) -> pd.Series:
 def _compute_value(price: pd.Series, monthly_return: pd.Series, config: FeatureConfig) -> pd.Series:
     """Compute the chosen value proxy on monthly data."""
     if config.value_method == "moving_average":
-        # Cheapness proxy: price relative to its trailing 12-month average.
+        # This creates a "cheap vs expensive" proxy that is stable in the cross-section:
+        # scaling by a trailing average reduces sensitivity to short-lived price spikes.
         moving_avg = price.rolling(12, min_periods=config.value_min_months).mean()
         divisor = moving_avg.replace(0, np.nan)
         return -(price / divisor)
 
-    # Long-term reversal: negative cumulative return from months t-60 to t-13.
+    # Reversal intentionally avoids the most recent year: long-horizon mean reversion
+    # is the signal, while short-horizon reversal can be microstructure/short-term noise.
     reversal = (
         (1 + monthly_return.shift(13))
         .rolling(48, min_periods=config.reversal_min_months)
@@ -97,6 +100,8 @@ def _compute_value(price: pd.Series, monthly_return: pd.Series, config: FeatureC
 
 def _compute_momentum(monthly_return: pd.Series, config: FeatureConfig) -> pd.Series:
     """Compute momentum as cumulative return from t-12 to t-2 (skip t-1)."""
+    # Skipping the most recent month reduces exposure to short-term reversal and
+    # helps ensure the signal is implementable at the start of month t.
     return (
         (1 + monthly_return.shift(2))
         .rolling(11, min_periods=config.momentum_min_months)
@@ -106,6 +111,8 @@ def _compute_momentum(monthly_return: pd.Series, config: FeatureConfig) -> pd.Se
 
 def _compute_volatility(daily_return: pd.Series, config: FeatureConfig) -> pd.Series:
     """Compute annualized realized volatility from daily returns."""
+    # Annualizing makes the metric comparable across windows and tickers, and
+    # the minimum-day threshold avoids extreme volatility estimates from thin data.
     realized_vol = (
         daily_return.rolling(config.volatility_window_days, min_periods=config.volatility_min_days)
         .std(ddof=0)
@@ -116,6 +123,8 @@ def _compute_volatility(daily_return: pd.Series, config: FeatureConfig) -> pd.Se
 
 def _compute_investment(monthly_volume: pd.Series, config: FeatureConfig) -> pd.Series:
     """Proxy investment with the change in log trailing-average trading activity."""
+    # Using a trailing average smooths episodic volume bursts; differencing logs
+    # makes the proxy closer to a growth rate rather than a level.
     avg_volume = monthly_volume.rolling(12, min_periods=config.investment_min_months).mean()
     log_avg_volume = np.log(avg_volume.replace(0, np.nan))
     return log_avg_volume.diff()
@@ -127,15 +136,20 @@ def _compute_profitability(
     config: FeatureConfig,
 ) -> pd.Series:
     """Compute the chosen profitability proxy using monthly inputs."""
-    # Use lagged monthly returns so the feature is known at the start of month t.
+    # Lagging returns ensures the statistic is known at the time it would be used
+    # for prediction, preventing accidental look-ahead through the current month.
     lagged = monthly_return.shift(1)
 
     if config.profitability_method == "rolling_sharpe":
+        # A rolling Sharpe is a risk-adjusted performance proxy: it rewards
+        # consistently positive returns and penalizes unstable return paths.
         rolling_mean = lagged.rolling(12, min_periods=config.profitability_min_months).mean()
         rolling_std = lagged.rolling(12, min_periods=config.profitability_min_months).std(ddof=0)
         rolling_std = rolling_std.replace(0, np.nan)
         return rolling_mean / rolling_std
 
+    # Normalizing cumulative return by volatility makes this proxy less sensitive
+    # to high-volatility names where raw cumulative returns can be misleading.
     cumulative = (
         (1 + lagged)
         .rolling(12, min_periods=config.profitability_min_months)
@@ -181,7 +195,8 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
 
     results: list[pd.DataFrame] = []
 
-    # Compute features one ticker at a time to keep indexing and resampling clean.
+    # Working ticker-by-ticker avoids cross-ticker leakage through rolling windows,
+    # and keeps resampling/index handling unambiguous.
     for ticker, df_ticker in raw.groupby(level="ticker", sort=True):
         df_sorted = df_ticker.droplevel("ticker").sort_index()
         df_sorted.index = pd.to_datetime(df_sorted.index)
@@ -189,7 +204,8 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
         price = df_sorted[cfg.price_col]
         volume = df_sorted[cfg.volume_col]
 
-        # Use provided returns if available; otherwise compute simple returns from price.
+        # When returns aren't provided, computing them with fill_method=None avoids
+        # fabricating returns across missing price observations.
         if cfg.return_col and cfg.return_col in df_sorted.columns:
             daily_ret = df_sorted[cfg.return_col].copy()
         else:
@@ -197,16 +213,22 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
 
         realized_daily_vol = _compute_volatility(daily_ret, cfg)
 
-        # Convert daily inputs to month-end series (single convention across all features).
+        # Resampling to a single month-end convention ensures all features align on
+        # exactly the same timestamps, which prevents silent merge dropouts later.
         monthly_price = price.resample("ME").last()
         monthly_volume = volume.resample("ME").mean()
         monthly_return = monthly_price.pct_change(fill_method=None)
 
-        # Volatility is taken at month end and then lagged one month.
+        # We shift volatility because at the start of month t you only know
+        # realized volatility through month t-1 (otherwise it would use future days).
         monthly_volatility = realized_daily_vol.resample("ME").last().shift(1)
 
-        # Core characteristics (most are already defined in lag-safe ways).
+        # The lag on dollar_volume makes it a true "known-at-start-of-month" signal:
+        # without the shift it would incorporate the current month's closing price/volume.
         dollar_volume = _compute_dollar_volume(monthly_price, monthly_volume).shift(1)
+
+        # These definitions either use lagged returns internally or trailing windows,
+        # which makes them usable predictors without requiring an extra shift here.
         value = _compute_value(monthly_price, monthly_return, cfg)
         momentum = _compute_momentum(monthly_return, cfg)
         investment = _compute_investment(monthly_volume, cfg)
@@ -227,7 +249,8 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
         features = features.set_index("ticker", append=True).reorder_levels(["ticker", "date"])
         results.append(features)
 
-    # Preserve schema even when there are no tickers / no output.
+    # Returning an empty, correctly-typed frame is friendlier to pipelines/tests
+    # than returning None or raising, and keeps downstream merges predictable.
     if not results:
         empty_index = pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"])
         return pd.DataFrame(
@@ -249,6 +272,6 @@ def compute_features(raw: pd.DataFrame, *, config: FeatureConfig | None = None) 
 
 
 __all__ = [
-    "FeatureConfig", 
-    "compute_features"
+    "FeatureConfig",
+    "compute_features",
 ]
