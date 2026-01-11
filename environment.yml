@@ -1,4 +1,4 @@
-name: eileen
+name: Nasdaq-Cross-Sectional-Return-Prediction
 channels:
   - conda-forge
   - defaults
